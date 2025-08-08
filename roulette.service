@@ -1,0 +1,13 @@
+[Unit]
+Description=Roulette Prediction Server
+After=network.target
+
+[Service]
+Type=simple
+User=www-data
+WorkingDirectory=/opt/roulette
+ExecStart=/usr/bin/uvicorn server:app --host 0.0.0.0 --port 8000
+Restart=on-failure
+
+[Install]
+WantedBy=multi-user.target
