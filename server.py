@@ -4,7 +4,7 @@ Roulette prediction server
 """
 
 from __future__ import annotations
-import math, csv, os, time, uuid
+import math, csv, os, time, uuid, errno
 from collections import deque
 from typing import List, Dict, Any, Optional
 
@@ -58,19 +58,6 @@ MU_ROLLING = 0.005  # rolling friction coefficient
 DT_INT = 0.001  # integration time step
 
 # File and limits
-# FIXED: Properly handle CSV path - if it's a directory, append dataset.csv
-csv_path_env = os.getenv("ROULETTE_CSV", os.path.join(os.path.expanduser("~"), "dataset.csv"))
-# Handle both existing directories and paths ending with separator
-if csv_path_env.endswith(os.sep) or os.path.isdir(csv_path_env):
-    CSV_PATH = os.path.join(csv_path_env.rstrip(os.sep), "dataset.csv")
-else:
-    # If no extension in filename and absolute path - treat as directory
-    head, tail = os.path.split(csv_path_env)
-    if head and tail and '.' not in tail:
-        CSV_PATH = os.path.join(csv_path_env, "dataset.csv")
-    else:
-        CSV_PATH = csv_path_env
-
 MAX_ROWS = int(os.getenv("ROULETTE_MAX_ROWS", "600"))
 MAX_ERR = int(os.getenv("ROULETTE_MAX_ERR", "50"))
 
@@ -90,6 +77,57 @@ CSV_HEADER = [
    "winning_number", "ts_winner",
    "error_slots", "latency_ms",
 ]
+
+# ---- robust CSV path picking + safe IO ----
+def _as_file_path(p: str) -> str:
+    """Если p — каталог (существующий/оканчивается на / или последний сегмент без точки) → дополним именем файла."""
+    if not p:
+        return ""
+    p = p.strip().rstrip("/\\")
+    base = os.path.basename(p)
+    if os.path.isdir(p) or p.endswith(os.sep) or ("." not in base and os.path.isabs(p)):
+        return os.path.join(p, "dataset.csv")
+    return p
+
+def _try_path(candidates: List[str]) -> str:
+    for c in candidates:
+        if not c:
+            continue
+        c = _as_file_path(c)
+        d = os.path.dirname(c) or "."
+        try:
+            os.makedirs(d, exist_ok=True)
+            # проверяем запись
+            with open(c, "a", encoding="utf-8") as f:
+                pass
+            # если файл новый — пишем заголовок
+            if os.path.getsize(c) == 0:
+                with open(c, "w", newline="", encoding="utf-8") as f:
+                    csv.writer(f).writerow(CSV_HEADER)
+            return c
+        except Exception as e:
+            print(f"[init] skip '{c}': {e}")
+            continue
+    raise RuntimeError("No writable location for dataset.csv")
+
+def pick_csv_path() -> str:
+    app_dir = os.path.dirname(os.path.abspath(__file__))
+    env_p  = os.getenv("ROULETTE_CSV", "").strip()
+    state  = os.getenv("STATE_DIRECTORY", "").split(":")[0]  # systemd StateDirectory
+    xdg    = os.getenv("XDG_STATE_HOME", os.path.join(os.path.expanduser("~"), ".local", "state"))
+
+    candidates = [
+        env_p,
+        os.path.join(state, "dataset.csv") if state else "",
+        os.path.join(xdg, "roulette", "dataset.csv"),
+        os.path.join(os.path.expanduser("~"), "roulette", "dataset.csv"),
+        os.path.join(app_dir, "data", "dataset.csv"),
+        "/var/tmp/roulette_dataset.csv",  # последний шанс (обычно переживает перезагрузку)
+    ]
+    return _try_path(candidates)
+
+CSV_PATH = pick_csv_path()
+print(f"[init] Using dataset: {CSV_PATH}")
 
 # ───────────────────────  math utils  ───────────────────────────────────
 def _savgol_5_2(arr):
@@ -191,22 +229,9 @@ def slots_delta(pred: int, win: int, direction: str = "cw") -> int:
 
 # ─────────────────────  CSV helpers  ────────────────────────────────────
 def ensure_csv():
-   # Create directory if needed
-   csv_dir = os.path.dirname(CSV_PATH)
-   if csv_dir and not os.path.exists(csv_dir):
-       try:
-           os.makedirs(csv_dir, exist_ok=True)
-       except Exception as e:
-           print(f"Warning: Could not create directory {csv_dir}: {e}")
-   
-   if not os.path.exists(CSV_PATH):
-       try:
-           with open(CSV_PATH, "w", newline="", encoding="utf-8") as f:
-               csv.writer(f).writerow(CSV_HEADER)
-           print(f"Created CSV file: {CSV_PATH}")
-       except Exception as e:
-           print(f"Error creating CSV file {CSV_PATH}: {e}")
-           raise
+    # уже сделано в pick_csv_path(); оставляем для совместимости
+    if not os.path.exists(CSV_PATH):
+        _try_path([CSV_PATH])
 
 def read_rows():
    if not os.path.isfile(CSV_PATH):
@@ -220,13 +245,24 @@ def read_rows():
        return deque(maxlen=800)
 
 def write_row(row: Dict[str, str]):
-   ensure_csv()
-   try:
-       with open(CSV_PATH, "a", newline="", encoding="utf-8") as f:
-           csv.DictWriter(f, fieldnames=CSV_HEADER).writerow(row)
-   except Exception as e:
-       print(f"Error writing to CSV file: {e}")
-       raise
+    ensure_csv()
+    try:
+        import fcntl
+        with open(CSV_PATH, "a", newline="", encoding="utf-8") as f:
+            try: 
+                fcntl.flock(f, fcntl.LOCK_EX)
+            except Exception: 
+                pass  # Windows не поддерживает fcntl
+            csv.DictWriter(f, fieldnames=CSV_HEADER).writerow(row)
+            f.flush()
+            os.fsync(f.fileno())
+            try: 
+                fcntl.flock(f, fcntl.LOCK_UN)
+            except Exception: 
+                pass
+    except Exception as e:
+        print(f"Error writing to CSV: {e}")
+        raise
 
 def tail_rows(n: int) -> List[Dict[str, str]]:
    rows = read_rows()
