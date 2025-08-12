@@ -1,5 +1,5 @@
 """
-Roulette prediction server
+Roulette prediction server with adaptive learning system
 
 """
 
@@ -59,10 +59,12 @@ DT_INT = 0.001  # integration time step
 
 # File and limits
 MAX_ROWS = int(os.getenv("ROULETTE_MAX_ROWS", "600"))
-MAX_ERR = int(os.getenv("ROULETTE_MAX_ERR", "50"))
 
-MIN_SPINS_FOR_MODE = int(os.getenv("ROULETTE_MIN_SPINS_FOR_MODE", "100"))
-GOOD_MEAN_ERROR = float(os.getenv("ROULETTE_GOOD_MEAN_ERROR", "8.0"))
+# Adaptive learning parameters
+MIN_ROWS_FOR_JUMPS = int(os.getenv("ROULETTE_MIN_ROWS_FOR_JUMPS", "30"))
+EXCELLENT_MEAN_ERROR = 3.0  # Excellent accuracy threshold
+GOOD_MEAN_ERROR = 5.0       # Good accuracy threshold  
+MAX_NO_IMPROVEMENT = 100    # Stop training after this many spins without improvement
 
 IMPACT_DT = float(os.getenv("ROULETTE_IMPACT_DT", "0.60"))
 
@@ -72,7 +74,7 @@ CSV_HEADER = [
    "ball_t2", "ball_theta2", "ball_phi2",
    "ball_t3", "ball_theta3", "ball_phi3",
    "omega_ball", "alpha_ball", "omega_wheel", "alpha_wheel",
-   "predicted_number", "periskok",
+   "predicted_number", "jump_numbers",
    "ts_predict",
    "winning_number", "ts_winner",
    "error_slots", "latency_ms",
@@ -268,129 +270,242 @@ def tail_rows(n: int) -> List[Dict[str, str]]:
    rows = read_rows()
    return list(rows)[-n:] if len(rows) > n else list(rows)
 
-def enough_stats() -> bool:
-   return len(tail_rows(MIN_SPINS_FOR_MODE)) >= MIN_SPINS_FOR_MODE
+# ─────────────────────  Adaptive Learning System  ───────────────────────
 
-def mean_error_good() -> bool:
-   """Check if mean error is good enough"""
-   recent = tail_rows(50)
-   if len(recent) < 10:
-       return False
-   
-   errors = []
-   for r in recent:
-       if r.get("winning_number") and r.get("predicted_number"):
-           try:
-               err = abs(slots_delta(
-                   int(r["predicted_number"]),
-                   int(r["winning_number"]),
-                   r.get("direction", "cw")
-               ))
-               errors.append(err)
-           except:
-               pass
-   
-   if not errors:
-       return False
-   
-   mean_err = sum(errors) / len(errors)
-   return mean_err <= GOOD_MEAN_ERROR
+def calculate_accuracy_metrics(rows: List[Dict[str, str]], window: int = 50) -> Dict[str, float]:
+    """Calculate accuracy metrics for adaptive learning"""
+    if len(rows) < 10:
+        return {
+            "mean_error": float('inf'),
+            "hit_rate": 0.0,
+            "jump_hit_rate": 0.0,
+            "improvement": 0.0
+        }
+    
+    # Get recent rows with winners
+    recent = [r for r in rows[-window:] if r.get("winning_number") and r.get("predicted_number")]
+    if not recent:
+        return {
+            "mean_error": float('inf'),
+            "hit_rate": 0.0,
+            "jump_hit_rate": 0.0,
+            "improvement": 0.0
+        }
+    
+    errors = []
+    hits = 0
+    jump_hits = 0
+    
+    for r in recent:
+        try:
+            pred = int(r["predicted_number"])
+            win = int(r["winning_number"])
+            err = abs(slots_delta(pred, win, r.get("direction", "cw")))
+            errors.append(err)
+            
+            if err == 0:
+                hits += 1
+            
+            # Check if winner was in jump_numbers
+            if r.get("jump_numbers"):
+                jumps = [int(n) for n in r["jump_numbers"].split(",") if n]
+                if win in jumps:
+                    jump_hits += 1
+        except:
+            pass
+    
+    if not errors:
+        return {
+            "mean_error": float('inf'),
+            "hit_rate": 0.0,
+            "jump_hit_rate": 0.0,
+            "improvement": 0.0
+        }
+    
+    mean_error = sum(errors) / len(errors)
+    hit_rate = (hits / len(errors)) * 100
+    jump_hit_rate = (jump_hits / len(errors)) * 100 if len(errors) > 0 else 0
+    
+    # Calculate improvement trend
+    if len(rows) > window * 2:
+        old_metrics = calculate_accuracy_metrics(rows[:-window], window)
+        if old_metrics["mean_error"] != float('inf') and old_metrics["mean_error"] > 0:
+            improvement = ((old_metrics["mean_error"] - mean_error) / old_metrics["mean_error"]) * 100
+        else:
+            improvement = 0.0
+    else:
+        improvement = 0.0
+    
+    return {
+        "mean_error": mean_error,
+        "hit_rate": hit_rate,
+        "jump_hit_rate": jump_hit_rate,
+        "improvement": improvement
+    }
 
-def offset_mode(direction: str) -> int:
-   hist: Dict[int, int] = {}
-   for r in tail_rows(MAX_ROWS):
-       if not r.get("winning_number"): 
-           continue
-       if r["direction"].lower() != direction.lower(): 
-           continue
-       try:
-           d = slots_delta(
-               int(r["predicted_number"]),
-               int(r["winning_number"]), 
-               direction
-           )
-           if abs(d) <= 12:  # Only consider reasonable offsets
-               hist[d] = hist.get(d, 0) + 1
-       except: 
-           pass
-   
-   if not hist: 
-       return 0
-   
-   # Return most common offset
-   return max(hist.items(), key=lambda kv: kv[1])[0]
+def calculate_training_progress(rows: List[Dict[str, str]]) -> float:
+    """Calculate overall training progress percentage"""
+    row_count = len(rows)
+    
+    if row_count < MIN_ROWS_FOR_JUMPS:
+        # Initial phase: 0-20%
+        return min((row_count / MIN_ROWS_FOR_JUMPS) * 20, 20)
+    
+    metrics = calculate_accuracy_metrics(rows)
+    mean_error = metrics["mean_error"]
+    
+    if mean_error == float('inf'):
+        return 20.0
+    
+    # Training phase: 20-80%
+    if row_count < 200:
+        base_progress = 20 + ((row_count - MIN_ROWS_FOR_JUMPS) / (200 - MIN_ROWS_FOR_JUMPS)) * 30
+        # Bonus for good accuracy
+        if mean_error < 10:
+            accuracy_bonus = (10 - mean_error) * 3
+        else:
+            accuracy_bonus = 0
+        return min(base_progress + accuracy_bonus, 80)
+    
+    # Optimization phase: 80-100%
+    if mean_error <= EXCELLENT_MEAN_ERROR:
+        return 95.0 + min(metrics["jump_hit_rate"] / 20, 5.0)  # 95-100%
+    elif mean_error <= GOOD_MEAN_ERROR:
+        return 85.0 + ((GOOD_MEAN_ERROR - mean_error) / (GOOD_MEAN_ERROR - EXCELLENT_MEAN_ERROR)) * 10
+    else:
+        return 80.0 + max(0, (10 - mean_error) * 2)
 
-def build_periskok(pred: int, direction: str) -> List[int]:
-   """Build list of 4 neighboring pockets based on learned offset"""
-   if not enough_stats() or not mean_error_good(): 
-       return []
-   
-   off = offset_mode(direction)
-   if off == 0:  # No clear offset pattern
-       return []
-   
-   # Get index of predicted + offset
-   i_center = idx_wrap(POS[pred] + off)
-   center_num = WSEQ[i_center]
-   
-   # Get 2 neighbors on each side
-   neighbors = []
-   for delta in [1, -1, 2, -2]:
-       idx = idx_wrap(i_center + delta)
-       neighbors.append(WSEQ[idx])
-   
-   # Return center + best 3 neighbors (total 4)
-   return [center_num] + neighbors[:3]
+def calculate_confidence(metrics: Dict[str, float], row_count: int) -> float:
+    """Calculate confidence in prediction"""
+    if row_count < MIN_ROWS_FOR_JUMPS:
+        return 0.0
+    
+    mean_error = metrics["mean_error"]
+    if mean_error == float('inf'):
+        return 0.0
+    
+    # Base confidence from error rate
+    if mean_error <= 3:
+        base_conf = 90
+    elif mean_error <= 5:
+        base_conf = 80
+    elif mean_error <= 8:
+        base_conf = 70
+    elif mean_error <= 12:
+        base_conf = 60
+    else:
+        base_conf = 50
+    
+    # Adjust for data volume
+    volume_factor = min(row_count / 200, 1.0)
+    
+    # Adjust for improvement trend
+    improvement_factor = min(max(metrics["improvement"], -20), 20) / 20
+    
+    confidence = base_conf * volume_factor + improvement_factor * 10
+    return min(max(confidence, 0), 100)
+
+def should_stop_training(rows: List[Dict[str, str]]) -> bool:
+    """Determine if training should stop"""
+    if len(rows) < 200:
+        return False
+    
+    metrics = calculate_accuracy_metrics(rows)
+    
+    # Stop if excellent accuracy achieved
+    if metrics["mean_error"] <= EXCELLENT_MEAN_ERROR and metrics["jump_hit_rate"] > 85:
+        return True
+    
+    # Check for no improvement
+    recent_100 = rows[-100:]
+    if len(recent_100) >= 100:
+        # Compare last 50 with previous 50
+        recent_metrics = calculate_accuracy_metrics(recent_100[-50:])
+        older_metrics = calculate_accuracy_metrics(recent_100[:50])
+        
+        if recent_metrics["mean_error"] >= older_metrics["mean_error"] - 0.5:
+            # No significant improvement
+            return True
+    
+    return False
+
+def offset_mode(direction: str, rows: List[Dict[str, str]]) -> int:
+    """Calculate most common offset with adaptive window"""
+    hist: Dict[int, int] = {}
+    
+    # Use all available data up to MAX_ROWS
+    for r in rows:
+        if not r.get("winning_number"): 
+            continue
+        if r["direction"].lower() != direction.lower(): 
+            continue
+        try:
+            d = slots_delta(
+                int(r["predicted_number"]),
+                int(r["winning_number"]), 
+                direction
+            )
+            # Adaptive window based on current accuracy
+            metrics = calculate_accuracy_metrics(rows)
+            max_offset = min(18, int(metrics["mean_error"] * 1.5)) if metrics["mean_error"] != float('inf') else 18
+            
+            if abs(d) <= max_offset:
+                hist[d] = hist.get(d, 0) + 1
+        except: 
+            pass
+    
+    if not hist: 
+        return 0
+    
+    # Return most common offset
+    return max(hist.items(), key=lambda kv: kv[1])[0]
+
+def build_jump_numbers(pred: int, direction: str, rows: List[Dict[str, str]]) -> List[int]:
+    """Build list of jump numbers based on learned patterns"""
+    if len(rows) < MIN_ROWS_FOR_JUMPS:
+        return []
+    
+    # Always try to provide jump numbers for learning
+    off = offset_mode(direction, rows)
+    
+    # Get index of predicted + offset
+    i_center = idx_wrap(POS[pred] + off) if off != 0 else POS[pred]
+    
+    # Adaptive selection based on accuracy
+    metrics = calculate_accuracy_metrics(rows)
+    mean_error = metrics["mean_error"]
+    
+    if mean_error <= 5:
+        # High accuracy: tight cluster
+        indices = [i_center, idx_wrap(i_center + 1), idx_wrap(i_center - 1), idx_wrap(i_center + 2)]
+    elif mean_error <= 10:
+        # Medium accuracy: wider spread
+        indices = []
+        for delta in [0, 1, -1, 2, -2, 3]:
+            indices.append(idx_wrap(i_center + delta))
+        indices = indices[:4]  # Take first 4
+    else:
+        # Low accuracy: very wide spread
+        indices = []
+        for delta in [0, 2, -2, 4, -4, 6]:
+            indices.append(idx_wrap(i_center + delta))
+        indices = indices[:4]  # Take first 4
+    
+    return [WSEQ[idx] for idx in indices]
 
 def valid_payload(ts: List[float], thetas: List[float], phis: List[float], direction: str) -> bool:
    """Validate incoming data"""
-   # Basic length check only
+   # Basic length check only for data collection
    if len(ts) == 3 and len(thetas) == 3 and len(phis) == 3:
        return True
    return False
-   
-   # # More strict validation - COMMENTED OUT FOR DATA COLLECTION
-   # if not is_strictly_inc(ts):
-   #     return False
-   
-   # try:
-   #     _, omega, alpha = fit_theta_poly(ts, thetas)
-   #     if not (0.1 <= abs(omega) <= 50):
-   #         return False
-   #     if not (-10 <= alpha <= 0.1):
-   #         return False
-   # except:
-   #     return False
-   
-   # return True
 
 def prune_csv():
    rows = read_rows()
    if len(rows) <= MAX_ROWS: 
        return
    
-   # Compute recent MAE
-   recent = list(rows)[-100:]
-   errs = []
-   for r in recent:
-       if r.get("winning_number") and r.get("predicted_number"):
-           try:
-               err = abs(slots_delta(
-                   int(r["predicted_number"]),
-                   int(r["winning_number"]),
-                   r.get("direction", "cw")
-               ))
-               errs.append(err)
-           except: 
-               pass
-   
-   mean_err = sum(errs) / len(errs) if errs else GOOD_MEAN_ERROR + 1
-   
-   # Drop old rows if error is bad
-   if mean_err > GOOD_MEAN_ERROR * 1.5:
-       rows = deque(list(rows)[100:], maxlen=800)
-   
-   # Enforce max rows
+   # Keep more recent data
    rows = deque(list(rows)[-MAX_ROWS:], maxlen=800)
    
    # Write back
@@ -405,7 +520,7 @@ def prune_csv():
        print(f"Error pruning CSV: {e}")
 
 # ─────────────────────────  FastAPI  ────────────────────────────────────
-app = FastAPI(title="Roulette Server")
+app = FastAPI(title="Adaptive Roulette Server")
 
 app.add_middleware(
    CORSMiddleware,
@@ -430,11 +545,27 @@ def startup_event():
 def root():
    try:
        ensure_csv()
-       rows_count = len(read_rows())
+       rows = read_rows()
+       rows_count = len(rows)
+       metrics = calculate_accuracy_metrics(list(rows))
+       progress = calculate_training_progress(list(rows))
    except Exception as e:
        print(f"Error in root endpoint: {e}")
        rows_count = 0
-   return {"status": "Roulette prediction server running", "dataset_rows": rows_count, "csv_path": CSV_PATH}
+       metrics = {"mean_error": float('inf'), "hit_rate": 0, "jump_hit_rate": 0, "improvement": 0}
+       progress = 0
+   
+   return {
+       "status": "Adaptive Roulette prediction server running", 
+       "dataset_rows": rows_count, 
+       "csv_path": CSV_PATH,
+       "training_progress": round(progress, 1),
+       "mean_error": round(metrics["mean_error"], 2) if metrics["mean_error"] != float('inf') else "N/A",
+       "accuracy": {
+           "hit_rate": round(metrics["hit_rate"], 1),
+           "jump_hit_rate": round(metrics["jump_hit_rate"], 1)
+       }
+   }
 
 @app.get("/health")
 def health():
@@ -453,7 +584,7 @@ def predict(req: PredictRequest):
        thetas = [c.theta for c in req.crossings]
        phis = [c.phi for c in req.crossings]
        
-       # Validate - SIMPLIFIED
+       # Validate
        if not valid_payload(ts, thetas, phis, req.direction):
            return {"ok": False, "error": "Invalid payload"}
        
@@ -471,7 +602,6 @@ def predict(req: PredictRequest):
            a0 = thetas[0]
            a1 = omega_ball
            a2 = alpha_ball / 2
-           # return {"ok": False, "error": f"Ball fit failed: {str(e)}"}
        
        # Fit wheel motion
        try:
@@ -507,8 +637,15 @@ def predict(req: PredictRequest):
        # Convert to number
        predicted_number = map_angle_to_number(theta_relative)
        
-       # Check for periskok
-       periskok = build_periskok(predicted_number, req.direction)
+       # Get current data and metrics
+       rows = list(read_rows())
+       metrics = calculate_accuracy_metrics(rows)
+       progress = calculate_training_progress(rows)
+       confidence = calculate_confidence(metrics, len(rows))
+       training_active = not should_stop_training(rows)
+       
+       # Build jump numbers
+       jump_numbers = build_jump_numbers(predicted_number, req.direction, rows)
        
        # Generate round ID
        round_id = str(uuid.uuid4())
@@ -527,7 +664,7 @@ def predict(req: PredictRequest):
            "omega_wheel": omega_wheel,
            "alpha_wheel": alpha_wheel,
            "predicted": predicted_number,
-           "periskok": periskok,
+           "jump_numbers": jump_numbers,
            "ts_predict": now
        }
        
@@ -538,13 +675,22 @@ def predict(req: PredictRequest):
            "prediction": int(predicted_number),
            "omega_ball": round(omega_ball, 6),
            "alpha_ball": round(alpha_ball, 6),
-           "dataset_rows": len(read_rows())
+           "dataset_rows": len(rows),
+           "accuracy": {
+               "current_error": round(metrics["mean_error"], 1) if metrics["mean_error"] != float('inf') else "N/A",
+               "improvement": round(metrics["improvement"], 1),
+               "confidence": round(confidence, 1),
+               "training_progress": round(progress, 1)
+           },
+           "training_mode": training_active
        }
        
-       if periskok:
-           response["periskok"] = periskok
+       if jump_numbers:
+           response["jump_numbers"] = jump_numbers
        
-       print(f"Prediction: {predicted_number}, Periskok: {periskok}, Rows: {response['dataset_rows']}")
+       print(f"Prediction: {predicted_number}, Jump numbers: {jump_numbers}, " +
+             f"Error: {response['accuracy']['current_error']}, " +
+             f"Progress: {response['accuracy']['training_progress']}%")
        
        return response
        
@@ -564,22 +710,25 @@ def log_winner(req: LogWinnerRequest):
        if entry is None:
            return {"ok": True, "ignored": True, "reason": "no_matching_round"}
        
+       # Check if we should stop training
+       rows = list(read_rows())
+       if should_stop_training(rows):
+           return {
+               "ok": True, 
+               "ignored": True, 
+               "reason": "training_complete",
+               "dataset_rows": len(rows),
+               "message": "Model has reached optimal accuracy. No further training needed."
+           }
+       
        # Get data from entry
        ts = entry["ts"]
        thetas = entry["thetas"]
        phis = entry["phis"]
        direction = entry["direction"]
        
-       # # VALIDATION REMOVED FOR DATA COLLECTION
-       # if len(ts) != 3 or len(thetas) != 3 or len(phis) != 3:
-       #     return {"ok": True, "ignored": True, "reason": "invalid_data_length"}
-       
        # Calculate error
        err = slots_delta(entry["predicted"], req.winning_number, direction)
-       
-       # # ERROR FILTER REMOVED FOR DATA COLLECTION
-       # if abs(err) > MAX_ERR:
-       #     return {"ok": True, "ignored": True, "reason": "error_too_large", "error_slots": err}
        
        # Build CSV row
        row = {
@@ -601,7 +750,7 @@ def log_winner(req: LogWinnerRequest):
            "omega_wheel": f"{entry['omega_wheel']:.6f}",
            "alpha_wheel": f"{entry['alpha_wheel']:.6f}",
            "predicted_number": str(entry["predicted"]),
-           "periskok": ",".join(map(str, entry["periskok"])) if entry["periskok"] else "",
+           "jump_numbers": ",".join(map(str, entry["jump_numbers"])) if entry["jump_numbers"] else "",
            "ts_predict": str(entry["ts_predict"]),
            "winning_number": str(req.winning_number),
            "ts_winner": str(req.timestamp or now),
@@ -612,10 +761,29 @@ def log_winner(req: LogWinnerRequest):
        write_row(row)
        prune_csv()
        
-       rows_count = len(read_rows())
-       print(f"Winner logged: predicted={entry['predicted']}, actual={req.winning_number}, error={err}, total_rows={rows_count}")
+       # Calculate updated metrics
+       rows = list(read_rows())
+       metrics = calculate_accuracy_metrics(rows)
+       progress = calculate_training_progress(rows)
        
-       return {"ok": True, "stored": True, "dataset_rows": rows_count}
+       # Check if winner was in jump numbers
+       hit_jump = req.winning_number in entry["jump_numbers"] if entry["jump_numbers"] else False
+       
+       print(f"Winner logged: predicted={entry['predicted']}, actual={req.winning_number}, " +
+             f"error={err} slots, hit_jump={hit_jump}, total_rows={len(rows)}")
+       
+       return {
+           "ok": True, 
+           "stored": True, 
+           "dataset_rows": len(rows),
+           "error_slots": err,
+           "hit_jump": hit_jump,
+           "metrics": {
+               "mean_error": round(metrics["mean_error"], 1) if metrics["mean_error"] != float('inf') else "N/A",
+               "training_progress": round(progress, 1),
+               "improvement": round(metrics["improvement"], 1)
+           }
+       }
        
    except Exception as e:
        print(f"Log winner error: {e}")
@@ -623,16 +791,68 @@ def log_winner(req: LogWinnerRequest):
        traceback.print_exc()
        return {"ok": False, "error": str(e)}
 
+@app.get("/stats")
+def get_stats():
+    """Get detailed statistics about the model performance"""
+    try:
+        rows = list(read_rows())
+        if not rows:
+            return {"ok": False, "error": "No data available"}
+        
+        metrics = calculate_accuracy_metrics(rows)
+        progress = calculate_training_progress(rows)
+        
+        # Calculate distribution of errors
+        error_dist = {}
+        for r in rows[-100:]:  # Last 100 spins
+            if r.get("winning_number") and r.get("predicted_number"):
+                try:
+                    err = abs(slots_delta(
+                        int(r["predicted_number"]),
+                        int(r["winning_number"]),
+                        r.get("direction", "cw")
+                    ))
+                    error_dist[err] = error_dist.get(err, 0) + 1
+                except:
+                    pass
+        
+        return {
+            "ok": True,
+            "total_rows": len(rows),
+            "training_progress": round(progress, 1),
+            "metrics": {
+                "mean_error": round(metrics["mean_error"], 2) if metrics["mean_error"] != float('inf') else "N/A",
+                "hit_rate": round(metrics["hit_rate"], 1),
+                "jump_hit_rate": round(metrics["jump_hit_rate"], 1),
+                "improvement": round(metrics["improvement"], 1)
+            },
+            "error_distribution": error_dist,
+            "training_active": not should_stop_training(rows)
+        }
+    except Exception as e:
+        print(f"Stats error: {e}")
+        return {"ok": False, "error": str(e)}
+
 if __name__ == "__main__":
    # Print startup info
-   print(f"Starting Roulette Server...")
+   print(f"Starting Adaptive Roulette Server...")
    print(f"CSV Path: {CSV_PATH}")
    print(f"Max Rows: {MAX_ROWS}")
+   print(f"Min Rows for Jump Numbers: {MIN_ROWS_FOR_JUMPS}")
    
    # Ensure CSV exists at startup
    try:
        ensure_csv()
+       rows = list(read_rows())
        print(f"CSV file ready at: {CSV_PATH}")
+       print(f"Current dataset: {len(rows)} rows")
+       
+       if len(rows) > 0:
+           metrics = calculate_accuracy_metrics(rows)
+           progress = calculate_training_progress(rows)
+           print(f"Training progress: {progress:.1f}%")
+           if metrics["mean_error"] != float('inf'):
+               print(f"Current mean error: {metrics['mean_error']:.1f} slots")
    except Exception as e:
        print(f"Failed to initialize CSV: {e}")
    
