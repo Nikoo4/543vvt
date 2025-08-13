@@ -66,7 +66,7 @@ POCKET_WIDTH = 0.053  # 53mm pocket width
 BOUNCE_RANDOMNESS = 0.15  # 15% random factor
 
 # Learning parameters
-MIN_DATA_FOR_BOUNCE_MODEL = 30  # Changed from 50 to 30
+MIN_DATA_FOR_BOUNCE_MODEL = 50
 BOUNCE_PATTERN_WINDOW = 100
 CONFIDENCE_THRESHOLD = 0.7
 
@@ -126,19 +126,47 @@ def append_record(record: Dict[str, str]):
         print(f"Error writing record: {e}")
 
 def maintain_dataset_size():
-    """Keep dataset within size limits"""
+    """Keep dataset within size limits and remove poor quality data"""
     records = read_dataset()
     
-    # Only enforce size limit, no quality filtering
+    # First pass: remove very poor quality records if we have enough data
+    if len(records) > 100:
+        # Calculate average error for quality assessment
+        recent_errors = []
+        for r in records[-50:]:
+            if r.get("error_slots"):
+                try:
+                    recent_errors.append(int(r["error_slots"]))
+                except:
+                    pass
+        
+        if recent_errors:
+            avg_recent_error = sum(recent_errors) / len(recent_errors)
+            
+            # Remove records with very high errors if we have better data
+            if avg_recent_error < 10:  # If we're doing well
+                filtered_records = []
+                for r in records:
+                    try:
+                        error = int(r.get("error_slots", 0))
+                        # Keep if error is reasonable or it's recent data
+                        if error < 15 or records.index(r) > len(records) - 50:
+                            filtered_records.append(r)
+                    except:
+                        filtered_records.append(r)
+                records = filtered_records
+    
+    # Second pass: enforce size limit
     if len(records) > MAX_DATASET_SIZE:
         records = records[-MAX_DATASET_SIZE:]
-        
-        # Rewrite file
+    
+    # Rewrite file if changes were made
+    if len(records) != len(read_dataset()):
         with open(DATA_PATH, "w", newline="", encoding="utf-8") as f:
             writer = csv.DictWriter(f, fieldnames=CSV_COLUMNS)
             writer.writeheader()
             writer.writerows(records)
-        print(f"Dataset size maintained: {len(records)} records")
+        print(f"Dataset cleaned: {len(records)} high-quality records retained")
 
 # ───────────────────────  Data Validation  ───────────────────────────────
 def validate_crossings(crossings: List[Crossing]) -> Dict[str, Any]:
@@ -208,11 +236,13 @@ def validate_crossings(crossings: List[Crossing]) -> Dict[str, Any]:
             issues.append(f"Angular velocity too high: {avg_angular_velocity:.2f} rad/s")
             quality_score *= 0.4
     
-    # Always allow prediction
-    valid = True  # Always valid for prediction
+    # Final assessment
+    valid = quality_score > 0.5  # Allow prediction if score > 0.5
+    store_quality = quality_score > 0.7  # Only store if score > 0.7
     
     return {
         "valid": valid,
+        "store_quality": store_quality,
         "quality_score": quality_score,
         "reason": "; ".join(issues) if issues else "OK",
         "issues": issues,
@@ -263,10 +293,7 @@ def fit_trajectory(times: List[float], positions: List[float]) -> Tuple[float, f
     
     if abs(det) < 1e-9:
         # Fallback to linear approximation
-        time_diff = times[-1] - times[0]
-        if abs(time_diff) < 1e-9:
-            return positions[0], 0.0, 0.0
-        omega = (positions[-1] - positions[0]) / time_diff
+        omega = (positions[-1] - positions[0]) / (times[-1] - times[0])
         return positions[0], omega, -0.5
     
     a0 = (sum_y*sum_t2*sum_t4 + sum_t*sum_t3*sum_t2y + sum_t2*sum_t3*sum_ty -
@@ -284,14 +311,11 @@ def calculate_impact_time(omega0: float, alpha: float) -> float:
     """Calculate time until ball reaches deflectors"""
     omega_critical = math.sqrt(GRAVITY * math.tan(TABLE_TILT) / TRACK_RADIUS)
     
-    # Time on rim - protect against division by zero
-    if abs(alpha) < 1e-9:
-        t_rim = 0
+    # Time on rim
+    if omega0 > omega_critical:
+        t_rim = (omega0 - omega_critical) / abs(alpha)
     else:
-        if omega0 > omega_critical:
-            t_rim = (omega0 - omega_critical) / abs(alpha)
-        else:
-            t_rim = 0
+        t_rim = 0
     
     # Time sliding on track
     r = TRACK_RADIUS
@@ -345,25 +369,13 @@ class BouncePredictor:
         if total >= MIN_DATA_FOR_BOUNCE_MODEL:
             self.pattern_confidence[key] = min(total / BOUNCE_PATTERN_WINDOW, 1.0)
     
-    def predict_bounce_distribution(self, impact_data: Dict[str, Any], dataset_size: int) -> List[int]:
+    def predict_bounce_distribution(self, impact_data: Dict[str, Any]) -> List[int]:
         """Predict most likely pockets after bounce"""
         key = self._get_pattern_key(impact_data)
         
-        # Check dataset size for decision
-        if dataset_size < 30:
-            # Pure physics-based prediction for first 30 records
-            return self._physics_based_prediction(impact_data)
-        elif dataset_size < 100:
-            # Hybrid approach for 30-100 records
-            if key not in self.bounce_patterns:
-                return self._physics_based_prediction(impact_data)
-            # Use statistical but with lower confidence threshold
-            pattern = self.bounce_patterns[key]
-            if sum(pattern.values()) < 5:
-                return self._physics_based_prediction(impact_data)
-        
-        # Full statistical prediction for 100+ records
+        # Check if we have enough data
         if key not in self.bounce_patterns or self.pattern_confidence.get(key, 0) < CONFIDENCE_THRESHOLD:
+            # Use physics-based prediction
             return self._physics_based_prediction(impact_data)
         
         # Use statistical prediction
@@ -697,6 +709,15 @@ def predict(request: PredictRequest):
         if not validation_result["valid"]:
             print(f"⚠️ Data validation failed: {validation_result['reason']}")
             print(f"Deviations: {validation_result['deviations']}")
+            
+            # Still make prediction but don't store if quality is too poor
+            if validation_result["quality_score"] < 0.3:
+                print("❌ Data quality too poor for prediction")
+                return {
+                    "ok": False, 
+                    "error": "Data quality insufficient",
+                    "validation": validation_result
+                }
         
         # Extract crossing data
         times = [c.t for c in request.crossings]
@@ -711,11 +732,7 @@ def predict(request: PredictRequest):
         try:
             _, omega_ball, alpha_ball = fit_trajectory(times, ball_angles_smooth)
         except:
-            time_diff = times[-1] - times[0]
-            if abs(time_diff) < 1e-9:
-                omega_ball = 0.0
-            else:
-                omega_ball = (ball_angles[-1] - ball_angles[0]) / time_diff
+            omega_ball = (ball_angles[-1] - ball_angles[0]) / (times[-1] - times[0])
             alpha_ball = -0.5
         
         try:
@@ -745,8 +762,7 @@ def predict(request: PredictRequest):
         }
         
         # Get bounce predictions
-        dataset_size = len(read_dataset())
-        jump_numbers = bounce_predictor.predict_bounce_distribution(impact_data, dataset_size)
+        jump_numbers = bounce_predictor.predict_bounce_distribution(impact_data)
         
         # Calculate current metrics
         avg_error = performance_tracker.get_average_error()
@@ -770,7 +786,8 @@ def predict(request: PredictRequest):
             "predicted": predicted_number,
             "jump_numbers": jump_numbers,
             "ts_predict": int(time.time() * 1000),
-            "quality_score": validation_result.get("quality_score", 1.0)
+            "quality_score": validation_result.get("quality_score", 1.0),
+            "store_quality": validation_result.get("store_quality", True)
         }
         
         # Log to console with learning status
@@ -806,7 +823,7 @@ def predict(request: PredictRequest):
                 "error_margin": int(avg_error) if avg_error != float('inf') else "N/A",
                 "improvement": round(improvement, 1)
             },
-            "dataset_rows": dataset_size,
+            "dataset_rows": len(read_dataset()),
             "data_quality": f"{validation_result.get('quality_score', 1.0)*100:.0f}%"
         }
         
@@ -844,7 +861,15 @@ def log_winner(request: LogWinnerRequest):
                 "learning_status": learning_status
             }
         
-        # NO QUALITY FILTERING - SAVE ALL DATA
+        # Check if data quality was good enough to store
+        if not prediction_data.get("store_quality", True):
+            print(f"⚠️ Skipping storage due to poor data quality (score: {prediction_data.get('quality_score', 0)*100:.0f}%)")
+            return {
+                "ok": True,
+                "ignored": True,
+                "reason": "poor_data_quality",
+                "quality_score": f"{prediction_data.get('quality_score', 0)*100:.0f}%"
+            }
         
         # Update bounce patterns
         impact_data = {
@@ -874,7 +899,7 @@ def log_winner(request: LogWinnerRequest):
         else:
             pattern = f"miss_{error}"
         
-        # Save to CSV - ALWAYS
+        # Save to CSV
         record = {
             "round_id": request.round_id,
             "ts_start": str(prediction_data["ts_start"]),
