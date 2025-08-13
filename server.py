@@ -13,7 +13,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
-# ─────────────────────────  Roulette Layout  ─────────────────────────────
+# ───────────────────────  Roulette Layout  ──────────────────────────────────
 WHEEL_SEQUENCE = [
     0, 32, 15, 19,  4, 21,  2, 25, 17, 34,  6, 27,
    13, 36, 11, 30,  8, 23, 10,  5, 24, 16, 33,  1,
@@ -23,32 +23,32 @@ POCKET_POSITION = {n: i for i, n in enumerate(WHEEL_SEQUENCE)}
 WHEEL_SIZE = len(WHEEL_SEQUENCE)
 
 def normalize_index(i: int) -> int: 
-    return i % WHEEL_SIZE
+   return i % WHEEL_SIZE
 
 def normalize_angle(a: float) -> float: 
-    return (a + 2*math.pi) % (2*math.pi)
+   return (a + 2*math.pi) % (2*math.pi)
 
-# ─────────────────────────  Request Models  ──────────────────────────────
+# ─────────────────────  Request Models  ─────────────────────────────────────
 class Crossing(BaseModel):
-    idx: int
-    t: float
-    theta: float
-    slot: Optional[int] = None
-    phi: float
+   idx: int
+   t: float
+   theta: float
+   slot: Optional[int] = None
+   phi: float
 
 class PredictRequest(BaseModel):
-    crossings: List[Crossing]
-    direction: str
-    theta_zero: float
-    ts_start: Optional[int] = None
+   crossings: List[Crossing]
+   direction: str
+   theta_zero: float
+   ts_start: Optional[int] = None
 
 class LogWinnerRequest(BaseModel):
-    round_id: str
-    winning_number: int
-    timestamp: Optional[int] = None
-    predicted_number: Optional[int] = None
+   round_id: str
+   winning_number: int
+   timestamp: Optional[int] = None
+   predicted_number: Optional[int] = None
 
-# ─────────────────────────  Physics Constants  ─────────────────────────────
+# ──────────────────────  Physics Constants  ─────────────────────────────────
 # Fundamental physics
 GRAVITY = 9.81  # m/s²
 WHEEL_RADIUS = 0.41  # meters
@@ -66,78 +66,39 @@ POCKET_WIDTH = 0.053  # 53mm pocket width
 BOUNCE_RANDOMNESS = 0.15  # 15% random factor
 
 # Learning parameters
-MIN_DATA_FOR_BOUNCE_MODEL = 50
+MIN_DATA_FOR_BOUNCE_MODEL = 30  # Уменьшено с 50 для быстрого старта
 BOUNCE_PATTERN_WINDOW = 100
-CONFIDENCE_THRESHOLD = 0.7
+CONFIDENCE_THRESHOLD = 0.6  # Уменьшено с 0.7 для более раннего использования
 
 # File management
 DATA_FILE_NAME = "roulette_data.csv"
 MAX_DATASET_SIZE = 1000
 
 CSV_COLUMNS = [
-    "round_id", "ts_start", "direction", "theta_zero",
-    "ball_t1", "ball_theta1", "ball_phi1",
-    "ball_t2", "ball_theta2", "ball_phi2",
-    "ball_t3", "ball_theta3", "ball_phi3",
-    "omega_ball", "alpha_ball", "omega_wheel", "alpha_wheel",
-    "predicted_number", "jump_numbers",
-    "ts_predict",
-    "winning_number", "ts_winner",
-    "error_slots", "bounce_pattern",
+   "round_id", "ts_start", "direction", "theta_zero",
+   "ball_t1", "ball_theta1", "ball_phi1",
+   "ball_t2", "ball_theta2", "ball_phi2",
+   "ball_t3", "ball_theta3", "ball_phi3",
+   "omega_ball", "alpha_ball", "omega_wheel", "alpha_wheel",
+   "predicted_number", "jump_numbers",
+   "ts_predict",
+   "winning_number", "ts_winner",
+   "error_slots", "bounce_pattern",
 ]
 
-# ─────────────────────────  File Management  ──────────────────────────────
-def _as_file_path(p: str) -> str:
-    """If p is a directory, append filename"""
-    if not p:
-        return ""
-    p = p.strip().rstrip("/\\")
-    base = os.path.basename(p)
-    if os.path.isdir(p) or p.endswith(os.sep) or ("." not in base and os.path.isabs(p)):
-        return os.path.join(p, DATA_FILE_NAME)
-    return p
-
-def _try_path(candidates: List[str]) -> str:
-    """Try each candidate path until one works"""
-    for c in candidates:
-        if not c:
-            continue
-        c = _as_file_path(c)
-        d = os.path.dirname(c) or "."
-        try:
-            os.makedirs(d, exist_ok=True)
-            # Test write access
-            with open(c, "a", encoding="utf-8") as f:
-                pass
-            # If new file, write header
-            if os.path.getsize(c) == 0:
-                with open(c, "w", newline="", encoding="utf-8") as f:
-                    csv.writer(f).writerow(CSV_COLUMNS)
-            return c
-        except Exception as e:
-            print(f"[init] skip '{c}': {e}")
-            continue
-    raise RuntimeError("No writable location for roulette_data.csv")
-
+# ─────────────────────  File Management  ────────────────────────────────────
 def get_data_path() -> str:
-    """Determine optimal path for data storage using working server logic"""
-    app_dir = os.path.dirname(os.path.abspath(__file__))
-    env_p = os.getenv("ROULETTE_DATA_PATH", "").strip()
-    state = os.getenv("STATE_DIRECTORY", "").split(":")[0]  # systemd StateDirectory
-    xdg = os.getenv("XDG_STATE_HOME", os.path.join(os.path.expanduser("~"), ".local", "state"))
-
-    candidates = [
-        env_p,
-        os.path.join(state, DATA_FILE_NAME) if state else "",
-        os.path.join(xdg, "roulette", DATA_FILE_NAME),
-        os.path.join(os.path.expanduser("~"), "roulette", DATA_FILE_NAME),
-        os.path.join(app_dir, "data", DATA_FILE_NAME),
-        "/var/tmp/roulette_data.csv",  # Last resort (usually survives reboot)
-    ]
-    return _try_path(candidates)
+    """Determine optimal path for data storage"""
+    env_path = os.getenv("ROULETTE_DATA_PATH", "")
+    if env_path and os.path.isdir(os.path.dirname(env_path)):
+        return env_path
+    
+    home_dir = os.path.expanduser("~")
+    data_dir = os.path.join(home_dir, ".roulette_predictor")
+    os.makedirs(data_dir, exist_ok=True)
+    return os.path.join(data_dir, DATA_FILE_NAME)
 
 DATA_PATH = get_data_path()
-print(f"[init] Using dataset: {DATA_PATH}")
 
 def initialize_csv():
     """Create CSV with headers if needed"""
@@ -207,7 +168,7 @@ def maintain_dataset_size():
             writer.writerows(records)
         print(f"Dataset cleaned: {len(records)} high-quality records retained")
 
-# ─────────────────────────  Data Validation  ──────────────────────────────
+# ─────────────────────  Data Validation  ────────────────────────────────────
 def validate_crossings(crossings: List[Crossing]) -> Dict[str, Any]:
     """
     Validate quality of crossing data
@@ -216,6 +177,9 @@ def validate_crossings(crossings: List[Crossing]) -> Dict[str, Any]:
     issues = []
     deviations = []
     quality_score = 1.0
+    
+    # Get current dataset size for adaptive validation
+    dataset_size = len(read_dataset())
     
     # Check angle deviations from 180°
     for i, c in enumerate(crossings):
@@ -230,14 +194,29 @@ def validate_crossings(crossings: List[Crossing]) -> Dict[str, Any]:
         deviation = min(dev_from_180, dev_from_0)
         deviations.append(deviation)
         
-        if deviation > 30:
-            issues.append(f"Cross #{i+1}: Large deviation {deviation:.1f}°")
-            quality_score *= 0.5
-        elif deviation > 20:
-            issues.append(f"Cross #{i+1}: Moderate deviation {deviation:.1f}°")
-            quality_score *= 0.8
-        elif deviation > 10:
-            quality_score *= 0.95
+        # АДАПТИВНАЯ ВАЛИДАЦИЯ: в начале менее строгая
+        if dataset_size < 50:
+            # Очень мягкая валидация для первых данных
+            if deviation > 45:
+                issues.append(f"Cross #{i+1}: Large deviation {deviation:.1f}°")
+                quality_score *= 0.9
+        elif dataset_size < 200:
+            # Средняя валидация
+            if deviation > 35:
+                issues.append(f"Cross #{i+1}: Large deviation {deviation:.1f}°")
+                quality_score *= 0.8
+            elif deviation > 25:
+                quality_score *= 0.95
+        else:
+            # Строгая валидация после накопления данных
+            if deviation > 30:
+                issues.append(f"Cross #{i+1}: Large deviation {deviation:.1f}°")
+                quality_score *= 0.5
+            elif deviation > 20:
+                issues.append(f"Cross #{i+1}: Moderate deviation {deviation:.1f}°")
+                quality_score *= 0.8
+            elif deviation > 10:
+                quality_score *= 0.95
     
     # Check time monotonicity
     times = [c.t for c in crossings]
@@ -250,17 +229,21 @@ def validate_crossings(crossings: List[Crossing]) -> Dict[str, Any]:
         intervals = [times[i+1] - times[i] for i in range(len(times)-1)]
         
         for i, interval in enumerate(intervals):
-            if interval < 0.1:
+            # Более мягкие проверки для начала
+            min_interval = 0.05 if dataset_size < 100 else 0.1
+            max_interval = 5.0 if dataset_size < 100 else 3.0
+            
+            if interval < min_interval:
                 issues.append(f"Interval {i+1} too short: {interval:.3f}s")
-                quality_score *= 0.5
-            elif interval > 3.0:
+                quality_score *= 0.7 if dataset_size < 100 else 0.5
+            elif interval > max_interval:
                 issues.append(f"Interval {i+1} too long: {interval:.3f}s")
-                quality_score *= 0.7
+                quality_score *= 0.8 if dataset_size < 100 else 0.7
         
         # Check consistency of intervals
         if len(intervals) >= 2:
             interval_ratio = max(intervals) / min(intervals)
-            if interval_ratio > 2.0:
+            if interval_ratio > 2.5:  # Увеличено с 2.0
                 issues.append(f"Inconsistent intervals (ratio: {interval_ratio:.1f})")
                 quality_score *= 0.8
     
@@ -275,9 +258,13 @@ def validate_crossings(crossings: List[Crossing]) -> Dict[str, Any]:
             issues.append(f"Angular velocity too high: {avg_angular_velocity:.2f} rad/s")
             quality_score *= 0.4
     
-    # Final assessment
-    valid = quality_score > 0.5  # Allow prediction if score > 0.5
-    store_quality = quality_score > 0.7  # Only store if score > 0.7
+    # Final assessment - ВСЕГДА разрешаем предсказание и запись в начале
+    if dataset_size < 50:
+        valid = True  # Всегда предсказываем
+        store_quality = True  # Всегда сохраняем первые 50 записей
+    else:
+        valid = quality_score > 0.5  # Allow prediction if score > 0.5
+        store_quality = quality_score > 0.6  # Уменьшено с 0.7
     
     return {
         "valid": valid,
@@ -288,7 +275,7 @@ def validate_crossings(crossings: List[Crossing]) -> Dict[str, Any]:
         "deviations": [f"{d:.1f}°" for d in deviations]
     }
 
-# ─────────────────────────  Mathematical Functions  ────────────────────────
+# ──────────────────────  Mathematical Functions  ────────────────────────────
 def smooth_data(data: List[float]) -> List[float]:
     """Apply Savitzky-Golay smoothing filter"""
     if len(data) < 5:
@@ -314,6 +301,11 @@ def fit_trajectory(times: List[float], positions: List[float]) -> Tuple[float, f
     if len(times) < 3:
         raise ValueError("Need at least 3 points")
     
+    # ИСПРАВЛЕНИЕ: Проверка на одинаковые времена
+    if len(set(times)) < 2:
+        print("Warning: All timestamps are identical, returning zero velocity")
+        return positions[0], 0.0, 0.0
+    
     t0 = times[0]
     dt = [t - t0 for t in times]
     n = len(dt)
@@ -331,8 +323,15 @@ def fit_trajectory(times: List[float], positions: List[float]) -> Tuple[float, f
     det = n*sum_t2*sum_t4 + 2*sum_t*sum_t2*sum_t3 - sum_t2**3 - n*sum_t3**2 - sum_t**2*sum_t4
     
     if abs(det) < 1e-9:
+        # ИСПРАВЛЕНИЕ: Добавлена проверка деления на ноль
+        time_diff = times[-1] - times[0]
+        if abs(time_diff) < 1e-9:
+            # Все времена одинаковые - возвращаем нулевую скорость
+            print("Warning: Zero time difference, returning zero velocity")
+            return positions[0], 0.0, 0.0
+        
         # Fallback to linear approximation
-        omega = (positions[-1] - positions[0]) / (times[-1] - times[0])
+        omega = (positions[-1] - positions[0]) / time_diff
         return positions[0], omega, -0.5
     
     a0 = (sum_y*sum_t2*sum_t4 + sum_t*sum_t3*sum_t2y + sum_t2*sum_t3*sum_ty -
@@ -387,7 +386,7 @@ def pocket_distance(pocket1: int, pocket2: int, direction: str = "cw") -> int:
     else:
         return normalize_index(i1 - i2)
 
-# ─────────────────────────  Bounce Physics Engine  ────────────────────────
+# ──────────────────────  Bounce Physics Engine  ────────────────────────────
 class BouncePredictor:
     """Advanced bounce prediction using physics and statistics"""
     
@@ -484,7 +483,7 @@ class BouncePredictor:
         
         return neighbors[:4 - skip]
 
-# ─────────────────────────  Learning Control System  ──────────────────────
+# ──────────────────────  Learning Control System  ──────────────────────────
 def should_stop_learning() -> bool:
     """
     Intelligent system to determine when to stop collecting data
@@ -626,7 +625,7 @@ def get_learning_status() -> Dict[str, Any]:
         "learning_active": not should_stop_learning()
     }
 
-# ─────────────────────────  Performance Metrics  ──────────────────────────
+# ──────────────────────  Performance Metrics  ───────────────────────────────
 class PerformanceTracker:
     """Track prediction accuracy and improvement"""
     
@@ -676,7 +675,7 @@ class PerformanceTracker:
         improvement = (self.improvement_baseline - current_error) / self.improvement_baseline * 100
         return max(0, improvement)
 
-# ─────────────────────────  Main Server  ──────────────────────────────────
+# ──────────────────────  Main Server  ───────────────────────────────────────
 app = FastAPI(title="Professional Roulette Prediction Server")
 
 app.add_middleware(
@@ -767,16 +766,22 @@ def predict(request: PredictRequest):
         ball_angles_smooth = smooth_data(ball_angles)
         wheel_angles_smooth = smooth_data(wheel_angles)
         
-        # Fit trajectories
+        # Fit trajectories - С ЗАЩИТОЙ ОТ ДЕЛЕНИЯ НА НОЛЬ
         try:
             _, omega_ball, alpha_ball = fit_trajectory(times, ball_angles_smooth)
-        except:
-            omega_ball = (ball_angles[-1] - ball_angles[0]) / (times[-1] - times[0])
+        except Exception as e:
+            print(f"Warning: fit_trajectory failed for ball: {e}")
+            # Fallback calculation
+            if len(times) >= 2 and abs(times[-1] - times[0]) > 1e-9:
+                omega_ball = (ball_angles[-1] - ball_angles[0]) / (times[-1] - times[0])
+            else:
+                omega_ball = 0.0
             alpha_ball = -0.5
         
         try:
             _, omega_wheel, alpha_wheel = fit_trajectory(times, wheel_angles_smooth)
-        except:
+        except Exception as e:
+            print(f"Warning: fit_trajectory failed for wheel: {e}")
             omega_wheel = 0
             alpha_wheel = 0
         
@@ -868,6 +873,8 @@ def predict(request: PredictRequest):
         
     except Exception as e:
         print(f"Prediction error: {e}")
+        import traceback
+        traceback.print_exc()
         return {"ok": False, "error": str(e)}
 
 @app.post("/log_winner")
@@ -900,8 +907,9 @@ def log_winner(request: LogWinnerRequest):
                 "learning_status": learning_status
             }
         
-        # Check if data quality was good enough to store
-        if not prediction_data.get("store_quality", True):
+        # ИЗМЕНЕНИЕ: Убираем проверку store_quality для первых записей
+        dataset_size = len(read_dataset())
+        if dataset_size >= 50 and not prediction_data.get("store_quality", True):
             print(f"⚠️ Skipping storage due to poor data quality (score: {prediction_data.get('quality_score', 0)*100:.0f}%)")
             return {
                 "ok": True,
@@ -972,6 +980,7 @@ def log_winner(request: LogWinnerRequest):
         # Log result
         hit_type = "DIRECT HIT" if pattern == "direct_hit" else "JUMP HIT" if pattern == "jump_hit" else "MISS"
         print(f"Result: {hit_type} - Predicted: {prediction_data['predicted']}, Actual: {request.winning_number}, Error: {error}")
+        print(f"Dataset size: {len(read_dataset())} records")
         
         return {
             "ok": True,
@@ -981,11 +990,14 @@ def log_winner(request: LogWinnerRequest):
             "current_accuracy": {
                 "average_error": round(performance_tracker.get_average_error(), 1),
                 "improvement": round(performance_tracker.get_improvement_percentage(), 1)
-            }
+            },
+            "dataset_size": len(read_dataset())
         }
         
     except Exception as e:
         print(f"Error logging winner: {e}")
+        import traceback
+        traceback.print_exc()
         return {"ok": False, "error": str(e)}
 
 @app.get("/statistics")
