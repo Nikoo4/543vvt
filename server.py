@@ -314,8 +314,10 @@ def calculate_impact_time(omega0: float, alpha: float) -> float:
     """Calculate time until ball reaches deflectors"""
     omega_critical = math.sqrt(GRAVITY * math.tan(TABLE_TILT) / TRACK_RADIUS)
     
-    # Time on rim
-    if omega0 > omega_critical:
+    # Time on rim - Fixed division by zero
+    if abs(alpha) < 1e-9:  # If alpha is essentially zero
+        t_rim = 0
+    elif omega0 > omega_critical:
         t_rim = (omega0 - omega_critical) / abs(alpha)
     else:
         t_rim = 0
@@ -374,15 +376,14 @@ class BouncePredictor:
     
     def predict_bounce_distribution(self, impact_data: Dict[str, Any]) -> List[int]:
         """Predict most likely pockets after bounce"""
-        records = read_dataset()
+        key = self._get_pattern_key(impact_data)
+        records_count = len(read_dataset())
         
-        # Use physics-only for first 30 records
-        if len(records) < 30:
+        # Use physics only for first 30 records
+        if records_count < 30:
             return self._physics_based_prediction(impact_data)
         
-        key = self._get_pattern_key(impact_data)
-        
-        # Check if we have enough data and confidence
+        # Check if we have enough data for statistical prediction
         if key not in self.bounce_patterns or self.pattern_confidence.get(key, 0) < CONFIDENCE_THRESHOLD:
             # Use physics-based prediction
             return self._physics_based_prediction(impact_data)
@@ -574,22 +575,19 @@ def get_learning_status() -> Dict[str, Any]:
     
     avg_error = sum(recent_errors) / len(recent_errors) if recent_errors else float('inf')
     
-    # Determine status based on record count
+    # Determine status
     if should_stop_learning():
         status = "optimized"
         message = "Model optimized - No longer collecting data"
-    elif len(records) < 30:
+    elif len(records) < 50:
         status = "initial"
-        message = f"Initial learning phase ({len(records)}/30) - Physics only"
-    elif len(records) < 100:
-        status = "training"
-        message = f"Active training ({len(records)}/100) - Starting pattern learning"
+        message = f"Initial learning phase ({len(records)}/50)"
     elif len(records) < 200:
-        status = "refining"
-        message = f"Refining model ({len(records)}/200) - Full pattern recognition"
+        status = "training"
+        message = f"Active training ({len(records)}/200)"
     else:
-        status = "mature"
-        message = f"Mature model (error: {avg_error:.1f}) - Optimizing accuracy"
+        status = "refining"
+        message = f"Refining model (error: {avg_error:.1f})"
     
     return {
         "status": status,
@@ -744,11 +742,7 @@ def predict(request: PredictRequest):
         try:
             _, omega_ball, alpha_ball = fit_trajectory(times, ball_angles_smooth)
         except:
-            time_diff = times[-1] - times[0]
-            if abs(time_diff) < 1e-9:
-                omega_ball = 0.0
-            else:
-                omega_ball = (ball_angles[-1] - ball_angles[0]) / time_diff
+            omega_ball = (ball_angles[-1] - ball_angles[0]) / (times[-1] - times[0])
             alpha_ball = -0.5
         
         try:
@@ -787,10 +781,11 @@ def predict(request: PredictRequest):
         # Generate round ID
         round_id = str(uuid.uuid4())
         
-        # Store for validation - always store if in first 50 records
-        records = read_dataset()
-        is_initial_learning = len(records) < 50
+        # Determine if we should store this prediction
+        records_count = len(read_dataset())
+        should_store = records_count < 50 or validation_result.get("store_quality", True)
         
+        # Store for validation
         pending_predictions[round_id] = {
             "ts_start": request.ts_start or int(time.time() * 1000),
             "direction": request.direction,
@@ -806,7 +801,7 @@ def predict(request: PredictRequest):
             "jump_numbers": jump_numbers,
             "ts_predict": int(time.time() * 1000),
             "quality_score": validation_result.get("quality_score", 1.0),
-            "store_quality": is_initial_learning or validation_result.get("store_quality", True)
+            "store_quality": should_store
         }
         
         # Log to console with learning status
@@ -823,10 +818,7 @@ def predict(request: PredictRequest):
         # Add quality warning if needed
         if validation_result.get("quality_score", 1.0) < 0.7:
             console_output["data_quality"] = f"{validation_result['quality_score']*100:.0f}%"
-            if is_initial_learning:
-                print("⚠️ Low quality data - but storing for initial learning")
-            else:
-                print("⚠️ Low quality data - results may be less accurate")
+            print("⚠️ Low quality data - results may be less accurate")
         
         # Add learning status
         learning_status = get_learning_status()
@@ -845,7 +837,7 @@ def predict(request: PredictRequest):
                 "error_margin": int(avg_error) if avg_error != float('inf') else "N/A",
                 "improvement": round(improvement, 1)
             },
-            "dataset_rows": len(records),
+            "dataset_rows": len(read_dataset()),
             "data_quality": f"{validation_result.get('quality_score', 1.0)*100:.0f}%"
         }
         
@@ -883,11 +875,9 @@ def log_winner(request: LogWinnerRequest):
                 "learning_status": learning_status
             }
         
-        # Check if data quality was good enough to store (except for first 50 records)
-        records = read_dataset()
-        is_initial_learning = len(records) < 50
-        
-        if not is_initial_learning and not prediction_data.get("store_quality", True):
+        # Check if we should store this data
+        records_count = len(read_dataset())
+        if not prediction_data.get("store_quality", True) and records_count >= 50:
             print(f"⚠️ Skipping storage due to poor data quality (score: {prediction_data.get('quality_score', 0)*100:.0f}%)")
             return {
                 "ok": True,
@@ -896,15 +886,14 @@ def log_winner(request: LogWinnerRequest):
                 "quality_score": f"{prediction_data.get('quality_score', 0)*100:.0f}%"
             }
         
-        # Update bounce patterns (only after 30 records)
-        if len(records) >= 30:
-            impact_data = {
-                'predicted': prediction_data['predicted'],
-                'omega_ball': prediction_data['omega_ball'],
-                'omega_wheel': prediction_data['omega_wheel'],
-                'direction': prediction_data['direction']
-            }
-            bounce_predictor.update_patterns(impact_data, request.winning_number)
+        # Update bounce patterns
+        impact_data = {
+            'predicted': prediction_data['predicted'],
+            'omega_ball': prediction_data['omega_ball'],
+            'omega_wheel': prediction_data['omega_wheel'],
+            'direction': prediction_data['direction']
+        }
+        bounce_predictor.update_patterns(impact_data, request.winning_number)
         
         # Update performance metrics
         performance_tracker.update(
@@ -959,9 +948,7 @@ def log_winner(request: LogWinnerRequest):
         # Log result
         hit_type = "DIRECT HIT" if pattern == "direct_hit" else "JUMP HIT" if pattern == "jump_hit" else "MISS"
         print(f"Result: {hit_type} - Predicted: {prediction_data['predicted']}, Actual: {request.winning_number}, Error: {error}")
-        
-        if is_initial_learning:
-            print(f"📊 Initial learning: {len(records) + 1}/50 records collected")
+        print(f"Dataset size: {records_count + 1} records")
         
         return {
             "ok": True,
