@@ -13,7 +13,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
-# ─────────────────────────  Roulette Layout  ────────────────────────────
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€  Roulette Layout  â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 WHEEL_SEQUENCE = [
     0, 32, 15, 19,  4, 21,  2, 25, 17, 34,  6, 27,
    13, 36, 11, 30,  8, 23, 10,  5, 24, 16, 33,  1,
@@ -28,7 +28,7 @@ def normalize_index(i: int) -> int:
 def normalize_angle(a: float) -> float: 
    return (a + 2*math.pi) % (2*math.pi)
 
-# ────────────────────────  Request Models  ──────────────────────────────
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€  Request Models  â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 class Crossing(BaseModel):
    idx: int
    t: float
@@ -48,9 +48,9 @@ class LogWinnerRequest(BaseModel):
    timestamp: Optional[int] = None
    predicted_number: Optional[int] = None
 
-# ────────────────────────────  Physics Constants  ──────────────────────────────────
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€  Physics Constants  â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 # Fundamental physics
-GRAVITY = 9.81  # m/s²
+GRAVITY = 9.81  # m/sÂ²
 WHEEL_RADIUS = 0.41  # meters
 TRACK_RADIUS = 0.48
 DEFLECTOR_RADIUS = 0.38
@@ -86,7 +86,7 @@ CSV_COLUMNS = [
    "error_slots", "bounce_pattern",
 ]
 
-# ───────────────────────  File Management  ───────────────────────────────
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€  File Management  â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 def get_data_path() -> str:
     """Determine optimal path for data storage"""
     env_path = os.getenv("ROULETTE_DATA_PATH", "")
@@ -168,7 +168,7 @@ def maintain_dataset_size():
             writer.writerows(records)
         print(f"Dataset cleaned: {len(records)} high-quality records retained")
 
-# ───────────────────────  Data Validation  ───────────────────────────────
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€  Data Validation  â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 def validate_crossings(crossings: List[Crossing]) -> Dict[str, Any]:
     """
     Validate quality of crossing data
@@ -178,12 +178,12 @@ def validate_crossings(crossings: List[Crossing]) -> Dict[str, Any]:
     deviations = []
     quality_score = 1.0
     
-    # Check angle deviations from 180°
+    # Check angle deviations from 180Â°
     for i, c in enumerate(crossings):
         angle_deg = (c.theta * 180 / math.pi) % 360
         
-        # Calculate deviation from 180°
-        # Handle both cases: near 180° and near 0°/360°
+        # Calculate deviation from 180Â°
+        # Handle both cases: near 180Â° and near 0Â°/360Â°
         dev_from_180 = abs(angle_deg - 180)
         dev_from_0 = min(angle_deg, 360 - angle_deg)
         
@@ -192,10 +192,10 @@ def validate_crossings(crossings: List[Crossing]) -> Dict[str, Any]:
         deviations.append(deviation)
         
         if deviation > 30:
-            issues.append(f"Cross #{i+1}: Large deviation {deviation:.1f}°")
+            issues.append(f"Cross #{i+1}: Large deviation {deviation:.1f}Â°")
             quality_score *= 0.5
         elif deviation > 20:
-            issues.append(f"Cross #{i+1}: Moderate deviation {deviation:.1f}°")
+            issues.append(f"Cross #{i+1}: Moderate deviation {deviation:.1f}Â°")
             quality_score *= 0.8
         elif deviation > 10:
             quality_score *= 0.95
@@ -246,10 +246,10 @@ def validate_crossings(crossings: List[Crossing]) -> Dict[str, Any]:
         "quality_score": quality_score,
         "reason": "; ".join(issues) if issues else "OK",
         "issues": issues,
-        "deviations": [f"{d:.1f}°" for d in deviations]
+        "deviations": [f"{d:.1f}Â°" for d in deviations]
     }
 
-# ───────────────────────  Mathematical Functions  ───────────────────────────────
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€  Mathematical Functions  â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 def smooth_data(data: List[float]) -> List[float]:
     """Apply Savitzky-Golay smoothing filter"""
     if len(data) < 5:
@@ -269,8 +269,8 @@ def smooth_data(data: List[float]) -> List[float]:
 
 def fit_trajectory(times: List[float], positions: List[float]) -> Tuple[float, float, float]:
     """
-    Fit quadratic trajectory: θ(t) = a₀ + a₁t + a₂t²
-    Returns: (a0, a1, a2) where ω=a1, α=2*a2
+    Fit quadratic trajectory: Î¸(t) = aâ‚€ + aâ‚t + aâ‚‚tÂ²
+    Returns: (a0, a1, a2) where Ï‰=a1, Î±=2*a2
     """
     if len(times) < 3:
         raise ValueError("Need at least 3 points")
@@ -348,7 +348,7 @@ def pocket_distance(pocket1: int, pocket2: int, direction: str = "cw") -> int:
     else:
         return normalize_index(i1 - i2)
 
-# ───────────────────────  Bounce Physics Engine  ───────────────────────────────
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€  Bounce Physics Engine  â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 class BouncePredictor:
     """Advanced bounce prediction using physics and statistics"""
     
@@ -445,7 +445,7 @@ class BouncePredictor:
         
         return neighbors[:4 - skip]
 
-# ───────────────────────  Learning Control System  ───────────────────────────────
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€  Learning Control System  â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 def should_stop_learning() -> bool:
     """
     Intelligent system to determine when to stop collecting data
@@ -487,10 +487,10 @@ def should_stop_learning() -> bool:
     
     # Criterion 1: Optimal accuracy achieved
     if avg_error <= 3.0 and accuracy_rate >= 0.85:
-        print("🎯 OPTIMAL ACCURACY REACHED")
+        print("ðŸŽ¯ OPTIMAL ACCURACY REACHED")
         print(f"   Average error: {avg_error:.1f} pockets")
         print(f"   Accuracy rate: {accuracy_rate*100:.1f}%")
-        print("   ➡️ Learning stopped - Model is optimized")
+        print("   âž¡ï¸ Learning stopped - Model is optimized")
         return True
     
     # Criterion 2: Check for improvement plateau
@@ -523,22 +523,22 @@ def should_stop_learning() -> bool:
             
             # No significant improvement
             if improvement < 0.5:
-                print("📊 LEARNING PLATEAU DETECTED")
+                print("ðŸ“Š LEARNING PLATEAU DETECTED")
                 print(f"   Old average: {old_avg:.1f} pockets")
                 print(f"   New average: {new_avg:.1f} pockets")
                 print(f"   Improvement: {improvement:.1f} pockets")
-                print("   ➡️ Learning stopped - No further improvement")
+                print("   âž¡ï¸ Learning stopped - No further improvement")
                 return True
     
     # Criterion 3: Maximum dataset size
     if len(records) >= MAX_DATASET_SIZE - 50:
-        print("📦 APPROACHING DATASET LIMIT")
+        print("ðŸ“¦ APPROACHING DATASET LIMIT")
         print(f"   Current records: {len(records)}")
         print(f"   Maximum allowed: {MAX_DATASET_SIZE}")
         
         # If we're also performing well, stop
         if avg_error <= 5.0:
-            print("   ➡️ Learning stopped - Good accuracy + size limit")
+            print("   âž¡ï¸ Learning stopped - Good accuracy + size limit")
             return True
     
     return False
@@ -587,7 +587,7 @@ def get_learning_status() -> Dict[str, Any]:
         "learning_active": not should_stop_learning()
     }
 
-# ───────────────────────  Performance Metrics  ───────────────────────────────
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€  Performance Metrics  â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 class PerformanceTracker:
     """Track prediction accuracy and improvement"""
     
@@ -637,7 +637,7 @@ class PerformanceTracker:
         improvement = (self.improvement_baseline - current_error) / self.improvement_baseline * 100
         return max(0, improvement)
 
-# ───────────────────────  Main Server  ───────────────────────────────
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€  Main Server  â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 app = FastAPI(title="Professional Roulette Prediction Server")
 
 app.add_middleware(
@@ -707,12 +707,12 @@ def predict(request: PredictRequest):
         # Validate crossing data quality
         validation_result = validate_crossings(request.crossings)
         if not validation_result["valid"]:
-            print(f"⚠️ Data validation failed: {validation_result['reason']}")
+            print(f"âš ï¸ Data validation failed: {validation_result['reason']}")
             print(f"Deviations: {validation_result['deviations']}")
             
             # Still make prediction but don't store if quality is too poor
             if validation_result["quality_score"] < 0.3:
-                print("❌ Data quality too poor for prediction")
+                print("âŒ Data quality too poor for prediction")
                 return {
                     "ok": False, 
                     "error": "Data quality insufficient",
@@ -791,7 +791,7 @@ def predict(request: PredictRequest):
         }
         
         # Log to console with learning status
-        print("✅ Prediction ready")
+        print("âœ… Prediction ready")
         console_output = {
             "predicted_number": predicted_number,
             "jump_numbers": jump_numbers,
@@ -804,12 +804,12 @@ def predict(request: PredictRequest):
         # Add quality warning if needed
         if validation_result.get("quality_score", 1.0) < 0.7:
             console_output["data_quality"] = f"{validation_result['quality_score']*100:.0f}%"
-            print("⚠️ Low quality data - results may be less accurate")
+            print("âš ï¸ Low quality data - results may be less accurate")
         
         # Add learning status
         learning_status = get_learning_status()
         if learning_status["status"] == "optimized":
-            console_output["model_status"] = "OPTIMIZED ✨"
+            console_output["model_status"] = "OPTIMIZED âœ¨"
         
         print(json.dumps(console_output, indent=2))
         
@@ -843,16 +843,16 @@ def log_winner(request: LogWinnerRequest):
         # Check if learning should stop
         if should_stop_learning():
             learning_status = get_learning_status()
-            print(f"🛑 Learning stopped: {learning_status['message']}")
+            print(f"ðŸ›‘ Learning stopped: {learning_status['message']}")
             
             # Still update metrics but don't save
             if request.winning_number == prediction_data['predicted']:
-                print(f"✅ Direct hit! (not saved - learning complete)")
+                print(f"âœ… Direct hit! (not saved - learning complete)")
             elif request.winning_number in prediction_data['jump_numbers']:
-                print(f"✅ Jump hit! (not saved - learning complete)")
+                print(f"âœ… Jump hit! (not saved - learning complete)")
             else:
                 error = abs(pocket_distance(prediction_data['predicted'], request.winning_number, prediction_data['direction']))
-                print(f"❌ Miss by {error} pockets (not saved - learning complete)")
+                print(f"âŒ Miss by {error} pockets (not saved - learning complete)")
             
             return {
                 "ok": True,
@@ -863,7 +863,7 @@ def log_winner(request: LogWinnerRequest):
         
         # Check if data quality was good enough to store
         if not prediction_data.get("store_quality", True):
-            print(f"⚠️ Skipping storage due to poor data quality (score: {prediction_data.get('quality_score', 0)*100:.0f}%)")
+            print(f"âš ï¸ Skipping storage due to poor data quality (score: {prediction_data.get('quality_score', 0)*100:.0f}%)")
             return {
                 "ok": True,
                 "ignored": True,
