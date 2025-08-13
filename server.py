@@ -13,7 +13,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
-# ─────────────────────────  Roulette Layout  ────────────────────────────
+# ─────────────────────────  Roulette Layout  ─────────────────────────────
 WHEEL_SEQUENCE = [
     0, 32, 15, 19,  4, 21,  2, 25, 17, 34,  6, 27,
    13, 36, 11, 30,  8, 23, 10,  5, 24, 16, 33,  1,
@@ -23,32 +23,32 @@ POCKET_POSITION = {n: i for i, n in enumerate(WHEEL_SEQUENCE)}
 WHEEL_SIZE = len(WHEEL_SEQUENCE)
 
 def normalize_index(i: int) -> int: 
-   return i % WHEEL_SIZE
+    return i % WHEEL_SIZE
 
 def normalize_angle(a: float) -> float: 
-   return (a + 2*math.pi) % (2*math.pi)
+    return (a + 2*math.pi) % (2*math.pi)
 
-# ────────────────────────  Request Models  ──────────────────────────────
+# ─────────────────────────  Request Models  ──────────────────────────────
 class Crossing(BaseModel):
-   idx: int
-   t: float
-   theta: float
-   slot: Optional[int] = None
-   phi: float
+    idx: int
+    t: float
+    theta: float
+    slot: Optional[int] = None
+    phi: float
 
 class PredictRequest(BaseModel):
-   crossings: List[Crossing]
-   direction: str
-   theta_zero: float
-   ts_start: Optional[int] = None
+    crossings: List[Crossing]
+    direction: str
+    theta_zero: float
+    ts_start: Optional[int] = None
 
 class LogWinnerRequest(BaseModel):
-   round_id: str
-   winning_number: int
-   timestamp: Optional[int] = None
-   predicted_number: Optional[int] = None
+    round_id: str
+    winning_number: int
+    timestamp: Optional[int] = None
+    predicted_number: Optional[int] = None
 
-# ────────────────────────────  Physics Constants  ──────────────────────────────────
+# ─────────────────────────  Physics Constants  ─────────────────────────────
 # Fundamental physics
 GRAVITY = 9.81  # m/s²
 WHEEL_RADIUS = 0.41  # meters
@@ -75,30 +75,69 @@ DATA_FILE_NAME = "roulette_data.csv"
 MAX_DATASET_SIZE = 1000
 
 CSV_COLUMNS = [
-   "round_id", "ts_start", "direction", "theta_zero",
-   "ball_t1", "ball_theta1", "ball_phi1",
-   "ball_t2", "ball_theta2", "ball_phi2",
-   "ball_t3", "ball_theta3", "ball_phi3",
-   "omega_ball", "alpha_ball", "omega_wheel", "alpha_wheel",
-   "predicted_number", "jump_numbers",
-   "ts_predict",
-   "winning_number", "ts_winner",
-   "error_slots", "bounce_pattern",
+    "round_id", "ts_start", "direction", "theta_zero",
+    "ball_t1", "ball_theta1", "ball_phi1",
+    "ball_t2", "ball_theta2", "ball_phi2",
+    "ball_t3", "ball_theta3", "ball_phi3",
+    "omega_ball", "alpha_ball", "omega_wheel", "alpha_wheel",
+    "predicted_number", "jump_numbers",
+    "ts_predict",
+    "winning_number", "ts_winner",
+    "error_slots", "bounce_pattern",
 ]
 
-# ───────────────────────  File Management  ───────────────────────────────
+# ─────────────────────────  File Management  ──────────────────────────────
+def _as_file_path(p: str) -> str:
+    """If p is a directory, append filename"""
+    if not p:
+        return ""
+    p = p.strip().rstrip("/\\")
+    base = os.path.basename(p)
+    if os.path.isdir(p) or p.endswith(os.sep) or ("." not in base and os.path.isabs(p)):
+        return os.path.join(p, DATA_FILE_NAME)
+    return p
+
+def _try_path(candidates: List[str]) -> str:
+    """Try each candidate path until one works"""
+    for c in candidates:
+        if not c:
+            continue
+        c = _as_file_path(c)
+        d = os.path.dirname(c) or "."
+        try:
+            os.makedirs(d, exist_ok=True)
+            # Test write access
+            with open(c, "a", encoding="utf-8") as f:
+                pass
+            # If new file, write header
+            if os.path.getsize(c) == 0:
+                with open(c, "w", newline="", encoding="utf-8") as f:
+                    csv.writer(f).writerow(CSV_COLUMNS)
+            return c
+        except Exception as e:
+            print(f"[init] skip '{c}': {e}")
+            continue
+    raise RuntimeError("No writable location for roulette_data.csv")
+
 def get_data_path() -> str:
-    """Determine optimal path for data storage"""
-    env_path = os.getenv("ROULETTE_DATA_PATH", "")
-    if env_path and os.path.isdir(os.path.dirname(env_path)):
-        return env_path
-    
-    home_dir = os.path.expanduser("~")
-    data_dir = os.path.join(home_dir, ".roulette_predictor")
-    os.makedirs(data_dir, exist_ok=True)
-    return os.path.join(data_dir, DATA_FILE_NAME)
+    """Determine optimal path for data storage using working server logic"""
+    app_dir = os.path.dirname(os.path.abspath(__file__))
+    env_p = os.getenv("ROULETTE_DATA_PATH", "").strip()
+    state = os.getenv("STATE_DIRECTORY", "").split(":")[0]  # systemd StateDirectory
+    xdg = os.getenv("XDG_STATE_HOME", os.path.join(os.path.expanduser("~"), ".local", "state"))
+
+    candidates = [
+        env_p,
+        os.path.join(state, DATA_FILE_NAME) if state else "",
+        os.path.join(xdg, "roulette", DATA_FILE_NAME),
+        os.path.join(os.path.expanduser("~"), "roulette", DATA_FILE_NAME),
+        os.path.join(app_dir, "data", DATA_FILE_NAME),
+        "/var/tmp/roulette_data.csv",  # Last resort (usually survives reboot)
+    ]
+    return _try_path(candidates)
 
 DATA_PATH = get_data_path()
+print(f"[init] Using dataset: {DATA_PATH}")
 
 def initialize_csv():
     """Create CSV with headers if needed"""
@@ -168,7 +207,7 @@ def maintain_dataset_size():
             writer.writerows(records)
         print(f"Dataset cleaned: {len(records)} high-quality records retained")
 
-# ───────────────────────  Data Validation  ───────────────────────────────
+# ─────────────────────────  Data Validation  ──────────────────────────────
 def validate_crossings(crossings: List[Crossing]) -> Dict[str, Any]:
     """
     Validate quality of crossing data
@@ -249,7 +288,7 @@ def validate_crossings(crossings: List[Crossing]) -> Dict[str, Any]:
         "deviations": [f"{d:.1f}°" for d in deviations]
     }
 
-# ───────────────────────  Mathematical Functions  ───────────────────────────────
+# ─────────────────────────  Mathematical Functions  ────────────────────────
 def smooth_data(data: List[float]) -> List[float]:
     """Apply Savitzky-Golay smoothing filter"""
     if len(data) < 5:
@@ -348,7 +387,7 @@ def pocket_distance(pocket1: int, pocket2: int, direction: str = "cw") -> int:
     else:
         return normalize_index(i1 - i2)
 
-# ───────────────────────  Bounce Physics Engine  ───────────────────────────────
+# ─────────────────────────  Bounce Physics Engine  ────────────────────────
 class BouncePredictor:
     """Advanced bounce prediction using physics and statistics"""
     
@@ -445,7 +484,7 @@ class BouncePredictor:
         
         return neighbors[:4 - skip]
 
-# ───────────────────────  Learning Control System  ───────────────────────────────
+# ─────────────────────────  Learning Control System  ──────────────────────
 def should_stop_learning() -> bool:
     """
     Intelligent system to determine when to stop collecting data
@@ -587,7 +626,7 @@ def get_learning_status() -> Dict[str, Any]:
         "learning_active": not should_stop_learning()
     }
 
-# ───────────────────────  Performance Metrics  ───────────────────────────────
+# ─────────────────────────  Performance Metrics  ──────────────────────────
 class PerformanceTracker:
     """Track prediction accuracy and improvement"""
     
@@ -637,7 +676,7 @@ class PerformanceTracker:
         improvement = (self.improvement_baseline - current_error) / self.improvement_baseline * 100
         return max(0, improvement)
 
-# ───────────────────────  Main Server  ───────────────────────────────
+# ─────────────────────────  Main Server  ──────────────────────────────────
 app = FastAPI(title="Professional Roulette Prediction Server")
 
 app.add_middleware(
