@@ -9,8 +9,6 @@ import math, csv, os, time, uuid, json
 from collections import deque, defaultdict
 from typing import List, Dict, Any, Optional, Tuple
 import numpy as np
-from scipy.integrate import odeint
-from scipy.optimize import minimize_scalar
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
@@ -59,7 +57,7 @@ GRAVITY = 9.81  # m/s²
 DEFAULT_WHEEL_RADIUS = 0.41  # Initial guess
 DEFAULT_TRACK_RADIUS = 0.48  # Initial guess
 DEFAULT_DEFLECTOR_RADIUS = 0.38  # Initial guess
-DEFAULT_TABLE_TILT = math.radians(0.5)  # Initial guess
+DEFAULT_TABLE_TILT = math.radians(2.5)  # Initial guess from original
 
 # Calibration parameters
 MIN_CALIBRATION_SPINS = 20  # Need at least 20 spins to calibrate
@@ -71,16 +69,16 @@ BALL_RADIUS = 0.01  # 10mm ball
 AIR_DENSITY = 1.225  # kg/m³
 DRAG_COEFFICIENT = 0.47  # sphere
 
-# Friction model (more realistic)
-ROLLING_FRICTION_COEFFICIENT = 0.005  # dimensionless
-SLIDING_FRICTION_COEFFICIENT = 0.4   # ball on track
+# Friction model
+ROLLING_FRICTION_COEFFICIENT = 0.005  # from original
 VISCOUS_FRICTION = 0.001  # speed-dependent term
+INTEGRATION_STEP = 0.001  # from original
 
 # Deflector physics
 DEFLECTOR_COUNT = 8  # typical for European wheel
 DEFLECTOR_HEIGHT = 0.014  # 14mm typical
 DEFLECTOR_ANGLE = math.radians(45)  # typical deflector angle
-COEFFICIENT_OF_RESTITUTION = 0.6  # energy retained after deflector hit
+COEFFICIENT_OF_RESTITUTION = 0.65  # from original DEFLECTOR_ELASTICITY
 
 # Pocket physics
 FRET_HEIGHT = 0.008  # 8mm pocket dividers
@@ -89,12 +87,12 @@ POCKET_DEPTH = 0.037  # 37mm typical
 FRET_ELASTICITY = 0.3  # energy retained hitting fret
 
 # Integration parameters
-INTEGRATION_STEP = 0.001  # 1ms time step
 MAX_INTEGRATION_TIME = 20.0  # seconds
 
 # Learning parameters
-MIN_DATA_FOR_PHYSICS_MODEL = 50  # Start physics predictions after 50 spins
-CONFIDENCE_THRESHOLD = 0.7
+MIN_DATA_FOR_PHYSICS_MODEL = 30  # from original MIN_DATA_FOR_BOUNCE_MODEL
+BOUNCE_PATTERN_WINDOW = 100  # from original
+CONFIDENCE_THRESHOLD = 0.7  # from original
 
 # File management (keeping original)
 DATA_FILE_NAME = "roulette_data.csv"
@@ -144,24 +142,23 @@ class WheelCalibration:
         
         # Extract timing patterns
         rim_times = []
-        impact_times = []
+        decel_rates = []
         
         for data in self.calibration_data:
             # Analyze deceleration patterns
-            crossings = data['crossings']
-            if len(crossings) >= 3:
-                # Time between crossings increases as ball slows
-                dt1 = crossings[1]['t'] - crossings[0]['t']
-                dt2 = crossings[2]['t'] - crossings[1]['t']
-                decel_ratio = dt2 / dt1
+            if 'omega_ball' in data['crossings'] and 'alpha_ball' in data['crossings']:
+                omega = abs(data['crossings']['omega_ball'])
+                alpha = abs(data['crossings']['alpha_ball'])
                 
-                # This ratio depends on wheel geometry
-                rim_times.append(dt1)
-                impact_times.append(data['outcome'].get('impact_time', 5.0))
+                # Estimate time for one revolution at this speed
+                if omega > 0:
+                    rim_time = (2 * math.pi) / omega
+                    rim_times.append(rim_time)
+                    decel_rates.append(alpha)
         
-        # Estimate wheel size from timing patterns
+        # Simple averaging without numpy
         if rim_times:
-            avg_rim_time = np.mean(rim_times)
+            avg_rim_time = sum(rim_times) / len(rim_times)
             # Typical ball velocity ~2-5 m/s on rim
             # One revolution time gives us circumference estimate
             estimated_circumference = avg_rim_time * 3.5  # Assuming ~3.5 m/s average
@@ -174,13 +171,8 @@ class WheelCalibration:
             self.deflector_radius = self.track_radius * 0.80
             
             # Estimate tilt from deceleration pattern
-            decel_rates = []
-            for data in self.calibration_data:
-                if 'alpha_ball' in data['crossings']:
-                    decel_rates.append(abs(data['crossings']['alpha_ball']))
-            
             if decel_rates:
-                avg_decel = np.mean(decel_rates)
+                avg_decel = sum(decel_rates) / len(decel_rates)
                 # Higher deceleration = more tilt
                 # Typical range: 0.5-2.0 rad/s²
                 self.table_tilt = math.radians(0.2 + (avg_decel - 0.5) * 0.5)
@@ -218,8 +210,11 @@ def try_path(candidates: List[str]) -> str:
         d = os.path.dirname(c) or "."
         try:
             os.makedirs(d, exist_ok=True)
+# Комментарии на русском сохранены из оригинала
+            # проверяем запись
             with open(c, "a", encoding="utf-8") as f:
                 pass
+            # если файл новый — пишем заголовок
             if os.path.getsize(c) == 0:
                 with open(c, "w", newline="", encoding="utf-8") as f:
                     csv.writer(f).writerow(CSV_COLUMNS)
@@ -300,16 +295,14 @@ class RoulettePhysics:
     def deflector_radius(self):
         return self.calibration.deflector_radius
         
-    def ball_dynamics(self, state: np.ndarray, t: float) -> np.ndarray:
+    def ball_dynamics(self, r: float, omega: float, v_r: float, t: float) -> Tuple[float, float]:
         """
-        Differential equations for ball motion on the track
-        state = [r, theta, dr/dt, dtheta/dt]
+        Simple ball dynamics without scipy ODE solver
+        Returns: (radial_acceleration, angular_acceleration)
         """
-        r, theta, v_r, omega = state
-        
         # Skip if ball has reached deflectors
         if r <= self.deflector_radius:
-            return np.array([0, 0, 0, 0])
+            return 0, 0
         
         # Velocity magnitude
         v_total = math.sqrt(v_r**2 + (r * omega)**2)
@@ -321,13 +314,10 @@ class RoulettePhysics:
         # Air resistance (quadratic in velocity)
         F_drag_r = 0.5 * AIR_DENSITY * DRAG_COEFFICIENT * math.pi * BALL_RADIUS**2 * v_r * v_total
         
-        # Friction force (combination of rolling and sliding)
-        if v_total > 0.001:  # Moving
-            # Direction of friction opposes motion
+        # Friction force
+        if v_total > 0.001:
             friction_r = ROLLING_FRICTION_COEFFICIENT * BALL_MASS * GRAVITY * math.cos(self.table_tilt) * (v_r / v_total)
             friction_theta = ROLLING_FRICTION_COEFFICIENT * BALL_MASS * GRAVITY * math.cos(self.table_tilt) * (r * omega / v_total)
-            
-            # Add viscous term
             friction_r += VISCOUS_FRICTION * v_r
             friction_theta += VISCOUS_FRICTION * r * omega
         else:
@@ -336,9 +326,9 @@ class RoulettePhysics:
         
         # Accelerations
         a_r = (F_centrifugal - F_gravity_r - F_drag_r - friction_r) / BALL_MASS
-        a_theta = -(friction_theta) / (BALL_MASS * r)
+        a_theta = -(friction_theta) / (BALL_MASS * r) if r > 0 else 0
         
-        return np.array([v_r, omega, a_r, a_theta])
+        return a_r, a_theta
     
     def find_rim_departure(self, omega_initial: float, alpha: float) -> Tuple[float, float]:
         """
@@ -366,30 +356,39 @@ class RoulettePhysics:
         """
         t_rim, omega_rim = self.find_rim_departure(omega_initial, alpha)
         
-        # Initial conditions when ball leaves rim
-        state0 = np.array([
-            self.track_radius,  # r
-            0.0,               # theta (relative)
-            0.0,               # v_r (starts with no radial velocity)
-            omega_rim          # angular velocity
-        ])
+        # Simple numerical integration without scipy
+        r = self.track_radius
+        v_r = 0.0  # radial velocity starts at 0
+        omega = omega_rim
+        t = 0
+        dt = INTEGRATION_STEP
         
-        # Time points for integration
-        t_span = np.linspace(0, MAX_INTEGRATION_TIME, int(MAX_INTEGRATION_TIME / INTEGRATION_STEP))
+        while r > self.deflector_radius and t < MAX_INTEGRATION_TIME:
+            # Calculate forces
+            F_centrifugal = BALL_MASS * r * omega**2
+            F_gravity_r = BALL_MASS * GRAVITY * math.sin(self.table_tilt)
+            
+            # Update velocities
+            a_r = (F_centrifugal - F_gravity_r) / BALL_MASS
+            v_r += a_r * dt
+            
+            # Update position
+            r += v_r * dt
+            
+            # Angular deceleration
+            omega += alpha * dt
+            
+            t += dt
+            
+            if omega <= 0:
+                break
         
-        # Solve differential equations
-        solution = odeint(self.ball_dynamics, state0, t_span)
+        # Calculate impact parameters
+        t_impact = t_rim + t
+        v_impact = math.sqrt(v_r**2 + (r * omega)**2)
+        angle_impact = math.atan2(v_r, r * omega) if r * omega != 0 else 0
         
-        # Find when ball reaches deflectors
-        for i, (r, theta, v_r, omega) in enumerate(solution):
-            if r <= self.deflector_radius:
-                t_impact = t_rim + t_span[i]
-                v_impact = math.sqrt(v_r**2 + (r * omega)**2)
-                angle_impact = math.atan2(v_r, r * omega)
-                return t_impact, v_impact, angle_impact
-        
-        # Fallback if no impact found
-        return t_rim + 5.0, 0.0, 0.0
+        return t_impact, v_impact, angle_impact
     
     def model_deflector_collision(self, v_impact: float, angle_impact: float) -> Dict[str, float]:
         """
@@ -418,27 +417,26 @@ class RoulettePhysics:
     def predict_scatter_distribution(self, collision_params: Dict[str, float]) -> List[Tuple[int, float]]:
         """
         Predict probability distribution of final pockets based on collision
-        Returns list of (pocket_offset, probability)
+        Returns list of (pocket_offset, probability) - simplified version
         """
         v_after = collision_params['velocity_after']
         bounce_height = collision_params['bounce_height']
         
-        # Higher velocity = more scatter
-        # Higher bounce = more randomness
-        mean_scatter = 2.5 * v_after / 5.0  # Normalized to ~5 m/s max impact
-        std_scatter = 1.0 + bounce_height / 0.02  # Normalized to 2cm bounce
-        
-        # Generate probability distribution
+        # Simple distribution based on velocity
         distribution = []
-        for offset in range(-6, 7):  # -6 to +6 pockets
-            # Gaussian distribution
-            prob = math.exp(-(offset - mean_scatter)**2 / (2 * std_scatter**2))
-            prob /= math.sqrt(2 * math.pi * std_scatter**2)
-            distribution.append((offset, prob))
         
-        # Normalize
-        total_prob = sum(p for _, p in distribution)
-        distribution = [(offset, p / total_prob) for offset, p in distribution]
+        # Center around expected scatter
+        if v_after > 3.0:
+            # High energy - wide scatter
+            weights = [0.05, 0.10, 0.15, 0.20, 0.20, 0.15, 0.10, 0.05]
+            offsets = [-3, -2, -1, 0, 1, 2, 3, 4]
+        else:
+            # Low energy - narrow scatter
+            weights = [0.05, 0.15, 0.30, 0.30, 0.15, 0.05, 0.00, 0.00]
+            offsets = [-2, -1, 0, 1, 2, 3, 4, 5]
+        
+        for offset, weight in zip(offsets, weights):
+            distribution.append((offset, weight))
         
         return distribution
 
@@ -513,21 +511,24 @@ class PhysicsBasedBouncePredictor:
         return physics_pred[:4]
     
     def _pure_physics_prediction(self, omega_ball: float, alpha_ball: float) -> List[int]:
-        """Pure physics-based prediction"""
-        # Simulate track motion
+        """Pure physics-based prediction - simplified version"""
+        # Get impact parameters
         t_impact, v_impact, angle_impact = self.physics.simulate_track_motion(
             abs(omega_ball), alpha_ball
         )
         
-        # Model deflector collision
-        collision_params = self.physics.model_deflector_collision(v_impact, angle_impact)
+        # Simple bounce pattern based on impact velocity
+        # Higher velocity = more scatter
+        if v_impact > 4.0:  # High speed impact
+            offsets = [2, -2, 3, -3, 4, -4, 1, -1]
+        elif v_impact > 2.5:  # Medium speed
+            offsets = [1, -1, 2, -2, 3, -3, 0, 4]
+        elif v_impact > 1.5:  # Low speed
+            offsets = [1, 2, 0, -1, 3, -2, -3, 4]
+        else:  # Very low speed
+            offsets = [0, 1, -1, 2, -2, 3, -3, 4]
         
-        # Get scatter distribution
-        distribution = self.physics.predict_scatter_distribution(collision_params)
-        
-        # Sort by probability and return offsets
-        distribution.sort(key=lambda x: x[1], reverse=True)
-        return [offset for offset, _ in distribution[:8]]
+        return offsets[:8]
     
     def _physics_based_prediction(self, omega_ball: float, alpha_ball: float) -> List[int]:
         """Physics prediction with learned corrections"""
@@ -649,7 +650,7 @@ def predict(request: PredictRequest):
         ball_angles = [c.theta for c in request.crossings]
         wheel_angles = [c.phi for c in request.crossings]
         
-        # Calculate velocities using finite differences
+        # Calculate velocities using finite differences (from original)
         dt1 = times[1] - times[0]
         dt2 = times[2] - times[1]
         
@@ -664,10 +665,10 @@ def predict(request: PredictRequest):
         omega_wheel = (wheel_angles[-1] - wheel_angles[0]) / (times[-1] - times[0])
         alpha_wheel = 0  # Assume constant for wheel
         
-        # PHYSICS-BASED PREDICTION
+        # PHYSICS-BASED PREDICTION (simplified without scipy)
         # 1. Calculate when ball reaches deflectors
         t_impact, v_impact, angle_impact = physics_engine.simulate_track_motion(
-            abs(omega_ball), alpha_ball
+            abs(omega_ball), abs(alpha_ball)  # Use absolute values
         )
         
         # 2. Predict ball and wheel positions at impact
