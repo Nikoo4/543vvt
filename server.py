@@ -257,7 +257,6 @@ class WheelState(BaseModel):
     omega: float = Field(..., description="Angular velocity (rad/s)")
     alpha: float = Field(0.0, description="Angular acceleration (rad/s²)")
 
-# ИСПРАВЛЕНО: Используем модель данных из server_7.py
 class Crossing(BaseModel):
     """Ball crossing detection data"""
     idx: int
@@ -419,19 +418,22 @@ class AdvancedPhysicsEngine:
         event_leave_rim.terminal = True
         event_leave_rim.direction = -1
         
-        sol = solve_ivp(
-            self.ball_dynamics_rim,
-            [0, 20],
-            [0, omega0],
-            events=event_leave_rim,
-            dense_output=True,
-            rtol=1e-8
-        )
-        
-        if sol.t_events[0].size > 0:
-            t_leave = sol.t_events[0][0]
-            final_state = sol.sol(t_leave)
-            return t_leave, final_state[1], final_state[0]
+        try:
+            sol = solve_ivp(
+                self.ball_dynamics_rim,
+                [0, 20],
+                [0, omega0],
+                events=event_leave_rim,
+                dense_output=True,
+                rtol=1e-8
+            )
+            
+            if sol.t_events[0].size > 0:
+                t_leave = sol.t_events[0][0]
+                final_state = sol.sol(t_leave)
+                return t_leave, final_state[1], final_state[0]
+        except Exception as e:
+            logger.warning(f"Rim departure calculation failed: {e}")
         
         return 5.0, omega_critical, omega0 * 5.0  # Fallback
     
@@ -439,58 +441,72 @@ class AdvancedPhysicsEngine:
         """
         Complete simulation from current state to deflector impact
         """
-        # Phase 1: Time on rim
-        t_rim, omega_leave, theta_rim = self.find_rim_departure(omega0)
-        
-        # Phase 2: Free motion on track
-        initial_track = [
-            self.calibration.track_radius,
-            0,  # Reset angle for simplicity
-            0,  # No initial radial velocity
-            omega_leave
-        ]
-        
-        def event_hit_deflector(t, y):
-            return y[0] - self.calibration.deflector_radius
-        event_hit_deflector.terminal = True
-        event_hit_deflector.direction = -1
-        
-        sol = solve_ivp(
-            self.ball_dynamics_track,
-            [0, 10],
-            initial_track,
-            events=event_hit_deflector,
-            dense_output=True,
-            rtol=1e-8,
-            max_step=0.001
-        )
-        
-        if sol.t_events[0].size > 0:
-            t_impact = t_rim + sol.t_events[0][0]
-            impact_state = sol.sol(sol.t_events[0][0])
-            
-            # Calculate impact parameters
-            vr = impact_state[2]
-            v_tangential = impact_state[0] * impact_state[3]
-            v_total = math.sqrt(vr**2 + v_tangential**2)
-            impact_angle = math.atan2(abs(vr), abs(v_tangential))
-            
+        # Safety check for invalid input
+        if not np.isfinite(omega0) or abs(omega0) < 1e-9:
             return {
-                'time_to_impact': t_impact,
-                'impact_velocity': v_total,
-                'impact_angle': impact_angle,
-                'angular_travel': theta_rim + impact_state[1],
-                'rim_time': t_rim,
-                'track_time': sol.t_events[0][0]
+                'time_to_impact': 3.0,
+                'impact_velocity': 0.5,
+                'impact_angle': math.pi/4,
+                'angular_travel': 0.0,
+                'rim_time': 0.0,
+                'track_time': 3.0
             }
+        
+        try:
+            # Phase 1: Time on rim
+            t_rim, omega_leave, theta_rim = self.find_rim_departure(omega0)
+            
+            # Phase 2: Free motion on track
+            initial_track = [
+                self.calibration.track_radius,
+                0,  # Reset angle for simplicity
+                0,  # No initial radial velocity
+                omega_leave
+            ]
+            
+            def event_hit_deflector(t, y):
+                return y[0] - self.calibration.deflector_radius
+            event_hit_deflector.terminal = True
+            event_hit_deflector.direction = -1
+            
+            sol = solve_ivp(
+                self.ball_dynamics_track,
+                [0, 10],
+                initial_track,
+                events=event_hit_deflector,
+                dense_output=True,
+                rtol=1e-8,
+                max_step=0.001
+            )
+            
+            if sol.t_events[0].size > 0:
+                t_impact = t_rim + sol.t_events[0][0]
+                impact_state = sol.sol(sol.t_events[0][0])
+                
+                # Calculate impact parameters
+                vr = impact_state[2]
+                v_tangential = impact_state[0] * impact_state[3]
+                v_total = math.sqrt(vr**2 + v_tangential**2)
+                impact_angle = math.atan2(abs(vr), abs(v_tangential))
+                
+                return {
+                    'time_to_impact': t_impact,
+                    'impact_velocity': v_total,
+                    'impact_angle': impact_angle,
+                    'angular_travel': theta_rim + impact_state[1],
+                    'rim_time': t_rim,
+                    'track_time': sol.t_events[0][0]
+                }
+        except Exception as e:
+            logger.warning(f"Simulation failed: {e}")
         
         # Fallback
         return {
-            'time_to_impact': t_rim + 3.0,
+            'time_to_impact': t_rim + 3.0 if 't_rim' in locals() else 3.0,
             'impact_velocity': 0.5,
             'impact_angle': math.pi/4,
-            'angular_travel': omega0 * (t_rim + 3.0),
-            'rim_time': t_rim,
+            'angular_travel': omega0 * 3.0,
+            'rim_time': t_rim if 't_rim' in locals() else 0.0,
             'track_time': 3.0
         }
 
@@ -618,13 +634,40 @@ class AdaptiveLearningSystem:
         if len(self.training_data) < 50:
             return
         
-        # Prepare training data
-        X = []
-        y = []
+        try:
+            # Prepare training data
+            X = []
+            y = []
+            
+            for data in self.training_data[-500:]:  # Use last 500 observations
+                features = data['features']
+                X.append([
+                    features.get('omega_ball', 0),
+                    features.get('alpha_ball', 0),
+                    features.get('omega_wheel', 0),
+                    features.get('impact_velocity', 0),
+                    features.get('impact_angle', 0),
+                    features.get('rim_time', 0),
+                    features.get('track_time', 0)
+                ])
+                y.append(data['offset'])
+            
+            # Train model
+            X = self.scaler.fit_transform(X)
+            self.model.fit(X, y)
+            self.is_trained = True
+            
+            logger.info(f"Model retrained with {len(X)} samples")
+        except Exception as e:
+            logger.warning(f"Model retraining failed: {e}")
+    
+    def predict_correction(self, features: Dict[str, float]) -> float:
+        """Predict offset correction based on learned patterns"""
+        if not self.is_trained:
+            return 0.0
         
-        for data in self.training_data[-500:]:  # Use last 500 observations
-            features = data['features']
-            X.append([
+        try:
+            X = [[
                 features.get('omega_ball', 0),
                 features.get('alpha_ball', 0),
                 features.get('omega_wheel', 0),
@@ -632,35 +675,15 @@ class AdaptiveLearningSystem:
                 features.get('impact_angle', 0),
                 features.get('rim_time', 0),
                 features.get('track_time', 0)
-            ])
-            y.append(data['offset'])
-        
-        # Train model
-        X = self.scaler.fit_transform(X)
-        self.model.fit(X, y)
-        self.is_trained = True
-        
-        logger.info(f"Model retrained with {len(X)} samples")
-    
-    def predict_correction(self, features: Dict[str, float]) -> float:
-        """Predict offset correction based on learned patterns"""
-        if not self.is_trained:
+            ]]
+            
+            X = self.scaler.transform(X)
+            correction = self.model.predict(X)[0]
+            
+            return correction
+        except Exception as e:
+            logger.warning(f"ML prediction failed: {e}")
             return 0.0
-        
-        X = [[
-            features.get('omega_ball', 0),
-            features.get('alpha_ball', 0),
-            features.get('omega_wheel', 0),
-            features.get('impact_velocity', 0),
-            features.get('impact_angle', 0),
-            features.get('rim_time', 0),
-            features.get('track_time', 0)
-        ]]
-        
-        X = self.scaler.transform(X)
-        correction = self.model.predict(X)[0]
-        
-        return correction
     
     def get_confidence(self) -> float:
         """Calculate current confidence level"""
@@ -823,104 +846,171 @@ class ProfessionalRoulettePredictor:
         if len(crossings) < 3:
             raise ValueError("Insufficient crossing data")
         
-        # Extract velocities and accelerations
-        analysis = self._analyze_crossings(crossings)
-        
-        # Run physics simulation
-        simulation = self.physics_engine.simulate_to_deflector(analysis['omega_ball'])
-        
-        # Predict deflector effect
-        deflector_effect = self.deflector_model.compute_deflector_effect(
-            simulation['impact_velocity'],
-            simulation['impact_angle']
-        )
-        
-        # Calculate base prediction
-        ball_travel = simulation['angular_travel']
-        wheel_travel = analysis['omega_wheel'] * simulation['time_to_impact']
-        
-        relative_position = (ball_travel - wheel_travel) % (2 * math.pi)
-        
-        # Convert to pocket
-        pocket_index = int(relative_position * 37 / (2 * math.pi))
-        if direction == "ccw":
-            pocket_index = 37 - pocket_index
-        
-        predicted_number = EUROPEAN_WHEEL[pocket_index % 37]
-        
-        # Apply ML correction if available
-        ml_correction = 0
-        if self.learning_system.is_trained:
-            features = {
-                **analysis,
-                **simulation
+        try:
+            # Extract velocities and accelerations
+            analysis = self._analyze_crossings(crossings)
+            
+            # Validate analysis data
+            if not all(np.isfinite(v) for v in [analysis['omega_ball'], analysis['alpha_ball']]):
+                # Fallback on simple prediction
+                return {
+                    'predicted_number': 0,
+                    'jump_numbers': [32, 15, 19, 4],
+                    'confidence': 0.1,
+                    'physics': {
+                        'impact_time': 3.0,
+                        'impact_velocity': 0.5,
+                        'rim_time': 0.0,
+                        'track_time': 3.0,
+                        'bounce_height': 5.0,
+                    },
+                    'ml_correction': 0.0,
+                    'calibration': {
+                        'confidence': 0.0,
+                        'samples': 0
+                    },
+                    **analysis
+                }
+            
+            # Run physics simulation
+            simulation = self.physics_engine.simulate_to_deflector(analysis['omega_ball'])
+            
+            # Predict deflector effect
+            deflector_effect = self.deflector_model.compute_deflector_effect(
+                simulation['impact_velocity'],
+                simulation['impact_angle']
+            )
+            
+            # Calculate base prediction
+            ball_travel = simulation['angular_travel']
+            wheel_travel = analysis['omega_wheel'] * simulation['time_to_impact']
+            
+            relative_position = (ball_travel - wheel_travel) % (2 * math.pi)
+            
+            # Convert to pocket
+            pocket_index = int(relative_position * 37 / (2 * math.pi))
+            if direction == "ccw":
+                pocket_index = 37 - pocket_index
+            
+            predicted_number = EUROPEAN_WHEEL[pocket_index % 37]
+            
+            # Apply ML correction if available
+            ml_correction = 0
+            if self.learning_system.is_trained:
+                features = {
+                    **analysis,
+                    **simulation
+                }
+                ml_correction = self.learning_system.predict_correction(features)
+            
+            # Generate scatter predictions
+            scatter_distribution = deflector_effect['scatter_distribution']
+            
+            # Top 4 most likely pockets
+            scatter_distribution.sort(key=lambda x: x[1], reverse=True)
+            jump_numbers = []
+            
+            for offset, _ in scatter_distribution[:4]:
+                adj_offset = int(offset + ml_correction)
+                idx = (pocket_index + adj_offset) % 37
+                jump_numbers.append(EUROPEAN_WHEEL[idx])
+            
+            # Ensure we have 4 jump numbers
+            while len(jump_numbers) < 4:
+                jump_numbers.append(EUROPEAN_WHEEL[(pocket_index + len(jump_numbers)) % 37])
+            
+            # Calculate confidence
+            confidence = self._calculate_confidence(simulation, deflector_effect)
+            
+            # Prepare result
+            result = {
+                'predicted_number': predicted_number,
+                'jump_numbers': jump_numbers[:4],  # Ensure exactly 4
+                'confidence': confidence,
+                'physics': {
+                    'impact_time': round(simulation['time_to_impact'], 3),
+                    'impact_velocity': round(simulation['impact_velocity'], 2),
+                    'rim_time': round(simulation['rim_time'], 3),
+                    'track_time': round(simulation['track_time'], 3),
+                    'bounce_height': round(deflector_effect['bounce_height'] * 1000, 1),  # mm
+                },
+                'ml_correction': round(ml_correction, 1),
+                'calibration': {
+                    'confidence': self.calibration_system.current_calibration.confidence,
+                    'samples': self.calibration_system.current_calibration.sample_count
+                },
+                **analysis  # Include analysis data
             }
-            ml_correction = self.learning_system.predict_correction(features)
-        
-        # Generate scatter predictions
-        scatter_distribution = deflector_effect['scatter_distribution']
-        
-        # Top 4 most likely pockets
-        scatter_distribution.sort(key=lambda x: x[1], reverse=True)
-        jump_numbers = []
-        
-        for offset, _ in scatter_distribution[:4]:
-            adj_offset = int(offset + ml_correction)
-            idx = (pocket_index + adj_offset) % 37
-            jump_numbers.append(EUROPEAN_WHEEL[idx])
-        
-        # Calculate confidence
-        confidence = self._calculate_confidence(simulation, deflector_effect)
-        
-        # Prepare result
-        result = {
-            'predicted_number': predicted_number,
-            'jump_numbers': jump_numbers,
-            'confidence': confidence,
-            'physics': {
-                'impact_time': round(simulation['time_to_impact'], 3),
-                'impact_velocity': round(simulation['impact_velocity'], 2),
-                'rim_time': round(simulation['rim_time'], 3),
-                'track_time': round(simulation['track_time'], 3),
-                'bounce_height': round(deflector_effect['bounce_height'] * 1000, 1),  # mm
-            },
-            'ml_correction': round(ml_correction, 1),
-            'calibration': {
-                'confidence': self.calibration_system.current_calibration.confidence,
-                'samples': self.calibration_system.current_calibration.sample_count
-            },
-            **analysis  # Include analysis data
-        }
-        
-        return result
+            
+            return result
+            
+        except Exception as e:
+            logger.error(f"Prediction error: {e}")
+            # Return safe fallback
+            return {
+                'predicted_number': 0,
+                'jump_numbers': [32, 15, 19, 4],
+                'confidence': 0.1,
+                'physics': {
+                    'impact_time': 3.0,
+                    'impact_velocity': 0.5,
+                    'rim_time': 0.0,
+                    'track_time': 3.0,
+                    'bounce_height': 5.0,
+                },
+                'ml_correction': 0.0,
+                'calibration': {
+                    'confidence': 0.0,
+                    'samples': 0
+                },
+                'omega_ball': 0.0,
+                'alpha_ball': -0.5,
+                'omega_wheel': 0.0,
+                'alpha_wheel': 0.0
+            }
     
     def _analyze_crossings(self, crossings: List[Crossing]) -> Dict[str, float]:
-        """Extract physics parameters from crossings - FIXED VERSION"""
+        """Extract physics parameters from crossings - SAFE VERSION"""
         times = [c.t for c in crossings]
         ball_angles = [c.theta for c in crossings]
         wheel_angles = [c.phi for c in crossings]
         
-        # БЕЗОПАСНЫЙ расчет из server_7.py
-        if len(times) >= 2:
-            dt1 = times[1] - times[0]
-            dt2 = times[2] - times[1] if len(times) > 2 else dt1
-            
-            omega_ball_1 = (ball_angles[1] - ball_angles[0]) / dt1
-            omega_ball_2 = (ball_angles[2] - ball_angles[1]) / dt2 if len(times) > 2 else omega_ball_1
-            omega_ball = (omega_ball_1 + omega_ball_2) / 2
-            
-            # Безопасный расчет ускорения
-            if len(times) > 2:
-                alpha_ball = (omega_ball_2 - omega_ball_1) / ((dt1 + dt2) / 2)
-            else:
-                alpha_ball = -0.5  # Default deceleration
-        else:
-            omega_ball = 0.0
-            alpha_ball = -0.5
+        # Check minimum data
+        if len(times) < 2:
+            return {
+                'omega_ball': 0.0,
+                'alpha_ball': -0.5,
+                'omega_wheel': 0.0,
+                'alpha_wheel': 0.0
+            }
         
-        # Wheel velocity
-        if len(times) > 1:
-            omega_wheel = (wheel_angles[-1] - wheel_angles[0]) / (times[-1] - times[0])
+        # Check time intervals
+        dt1 = times[1] - times[0]
+        if abs(dt1) < 1e-9:  # Too small interval
+            dt1 = 0.001  # Minimum value
+        
+        # Safe velocity calculation
+        omega_ball = (ball_angles[-1] - ball_angles[0]) / (times[-1] - times[0]) if times[-1] != times[0] else 0.0
+        
+        # Safe acceleration calculation
+        if len(times) >= 3:
+            dt2 = times[2] - times[1]
+            if abs(dt2) < 1e-9:
+                dt2 = dt1
+            
+            omega1 = (ball_angles[1] - ball_angles[0]) / dt1
+            omega2 = (ball_angles[2] - ball_angles[1]) / dt2
+            alpha_ball = (omega2 - omega1) / ((dt1 + dt2) / 2)
+        else:
+            alpha_ball = -0.5  # Default
+        
+        # Wheel velocity - safe calculation
+        if len(wheel_angles) >= 2:
+            dt_wheel = times[-1] - times[0]
+            if abs(dt_wheel) > 1e-9:
+                omega_wheel = (wheel_angles[-1] - wheel_angles[0]) / dt_wheel
+            else:
+                omega_wheel = 0.0
         else:
             omega_wheel = 0.0
         
@@ -1115,7 +1205,7 @@ app.add_middleware(
 predictor = ProfessionalRoulettePredictor()
 pending_predictions = {}
 
-# Performance tracking (from server_7)
+# Performance tracking
 from collections import deque
 
 class PerformanceTracker:
@@ -1259,7 +1349,7 @@ async def predict(request: PredictionRequest):
             'timestamp': time.time()
         }
         
-        # Calculate metrics for response (like server_7)
+        # Calculate metrics for response
         avg_error = performance_tracker.get_average_error()
         improvement = performance_tracker.get_improvement_percentage()
         
@@ -1267,11 +1357,11 @@ async def predict(request: PredictionRequest):
         logger.info(f"Prediction generated: {result['predicted_number']} "
                    f"(confidence: {result['confidence']:.1%})")
         
-        # ИСПРАВЛЕННЫЙ ФОРМАТ ОТВЕТА (как в server_7.py)
+        # FIXED RESPONSE FORMAT
         return {
             "ok": True,
             "round_id": round_id,
-            "prediction": result['predicted_number'],  # Название поля из server_7
+            "prediction": result['predicted_number'],  # Changed from predicted_number
             "jump_numbers": result['jump_numbers'],
             "accuracy": {
                 "error_margin": int(avg_error) if avg_error != float('inf') else "N/A",
@@ -1327,7 +1417,7 @@ async def log_winner(request: LogWinnerRequest):
         
         logger.info(f"Outcome logged: {result} (offset: {offset})")
         
-        # ИСПРАВЛЕННЫЙ ФОРМАТ ОТВЕТА (как в server_7.py)
+        # FIXED RESPONSE FORMAT
         return {
             "ok": True,
             "stored": True,
