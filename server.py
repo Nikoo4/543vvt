@@ -15,6 +15,7 @@ from collections import deque, defaultdict
 from typing import List, Dict, Any, Optional, Tuple, Union
 from dataclasses import dataclass, field
 from enum import Enum
+from pathlib import Path
 
 import numpy as np
 from scipy.integrate import solve_ivp, odeint
@@ -35,7 +36,287 @@ logging.basicConfig(
 )
 logger = logging.getLogger("RoulettePredictor")
 
-# ════════════════════════════════  Physical Constants  ══════════════════════════════════
+# ═══════════════════════════  Data Storage System  ═══════════════════════════════
+
+class DataStorageManager:
+    """
+    Advanced file management system for roulette data
+    Handles creation, validation, and maintenance of data files
+    """
+    
+    def __init__(self):
+        self.data_path = self._initialize_data_path()
+        self.csv_path = self._initialize_csv_path()
+        self.json_path = self._initialize_json_path()
+        self.backup_dir = self._initialize_backup_directory()
+        
+    def _initialize_data_path(self) -> Path:
+        """
+        Initialize the main data directory
+        Priority order: environment variable, user home, temp, current directory
+        """
+        # Check environment variable first
+        env_path = os.environ.get('ROULETTE_DATA_PATH')
+        if env_path:
+            path = Path(env_path)
+            if self._try_create_directory(path):
+                logger.info(f"Using environment-specified data path: {path}")
+                return path
+        
+        # Try user home directory
+        home_path = Path.home() / '.roulette_predictor'
+        if self._try_create_directory(home_path):
+            logger.info(f"Using home directory data path: {home_path}")
+            return home_path
+        
+        # Try temp directory
+        temp_path = Path('/tmp') / 'roulette_predictor'
+        if self._try_create_directory(temp_path):
+            logger.info(f"Using temp directory data path: {temp_path}")
+            return temp_path
+        
+        # Fall back to current directory
+        current_path = Path('.') / 'roulette_data'
+        if self._try_create_directory(current_path):
+            logger.info(f"Using current directory data path: {current_path}")
+            return current_path
+        
+        # Last resort - use current directory directly
+        logger.warning("Using current directory for data storage")
+        return Path('.')
+    
+    def _try_create_directory(self, path: Path) -> bool:
+        """
+        Attempt to create a directory with proper permissions
+        Returns True if successful, False otherwise
+        """
+        try:
+            path.mkdir(parents=True, exist_ok=True)
+            # Test write permissions
+            test_file = path / '.test_write'
+            test_file.touch()
+            test_file.unlink()
+            return True
+        except Exception as e:
+            logger.debug(f"Cannot create/write to directory {path}: {e}")
+            return False
+    
+    def _initialize_csv_path(self) -> Path:
+        """
+        Initialize CSV file for data logging
+        Creates file with headers if it doesn't exist
+        """
+        csv_file = self.data_path / 'roulette_data.csv'
+        
+        if not csv_file.exists():
+            self._create_csv_with_headers(csv_file)
+            logger.info(f"Created new CSV file: {csv_file}")
+        else:
+            # Validate existing CSV
+            if self._validate_csv_structure(csv_file):
+                logger.info(f"Using existing CSV file: {csv_file}")
+            else:
+                # Backup corrupted file and create new one
+                backup_name = f"roulette_data_backup_{int(time.time())}.csv"
+                backup_path = self.data_path / backup_name
+                csv_file.rename(backup_path)
+                logger.warning(f"Backed up corrupted CSV to {backup_path}")
+                self._create_csv_with_headers(csv_file)
+                logger.info(f"Created new CSV file: {csv_file}")
+        
+        return csv_file
+    
+    def _initialize_json_path(self) -> Path:
+        """
+        Initialize JSON file for model persistence
+        """
+        json_file = self.data_path / 'roulette_model.json'
+        
+        if not json_file.exists():
+            # Create empty JSON structure
+            initial_data = {
+                'version': '4.0',
+                'created': time.time(),
+                'dataset': [],
+                'training': [],
+                'calibration': {},
+                'statistics': {}
+            }
+            self._write_json(json_file, initial_data)
+            logger.info(f"Created new JSON file: {json_file}")
+        
+        return json_file
+    
+    def _initialize_backup_directory(self) -> Path:
+        """
+        Create backup directory for data archiving
+        """
+        backup_dir = self.data_path / 'backups'
+        backup_dir.mkdir(exist_ok=True)
+        return backup_dir
+    
+    def _create_csv_with_headers(self, csv_file: Path):
+        """
+        Create CSV file with proper headers
+        """
+        headers = [
+            'timestamp', 'round_id', 'predicted_number', 'actual_number',
+            'offset', 'confidence', 'omega_ball', 'alpha_ball', 'omega_wheel',
+            'impact_velocity', 'impact_angle', 'rim_time', 'track_time',
+            'ml_correction', 'calibration_confidence', 'result'
+        ]
+        
+        with csv_file.open('w', newline='') as f:
+            writer = csv.writer(f)
+            writer.writerow(headers)
+    
+    def _validate_csv_structure(self, csv_file: Path) -> bool:
+        """
+        Validate that CSV file has correct structure
+        """
+        try:
+            with csv_file.open('r') as f:
+                reader = csv.reader(f)
+                headers = next(reader, None)
+                if not headers or len(headers) < 10:
+                    return False
+                # Check for essential columns
+                essential = ['timestamp', 'round_id', 'predicted_number', 'actual_number']
+                return all(col in headers for col in essential)
+        except Exception as e:
+            logger.error(f"CSV validation error: {e}")
+            return False
+    
+    def _write_json(self, json_file: Path, data: Dict):
+        """
+        Safely write JSON data with atomic operation
+        """
+        temp_file = json_file.with_suffix('.tmp')
+        try:
+            with temp_file.open('w') as f:
+                json.dump(data, f, indent=2)
+            # Atomic rename
+            temp_file.replace(json_file)
+        except Exception as e:
+            logger.error(f"Error writing JSON: {e}")
+            if temp_file.exists():
+                temp_file.unlink()
+            raise
+    
+    def append_csv_record(self, record: Dict):
+        """
+        Append a record to CSV file with error handling
+        """
+        try:
+            with self.csv_path.open('a', newline='') as f:
+                writer = csv.DictWriter(f, fieldnames=record.keys())
+                writer.writerow(record)
+        except Exception as e:
+            logger.error(f"Error appending to CSV: {e}")
+    
+    def save_model_data(self, data: Dict):
+        """
+        Save model data to JSON file
+        """
+        self._write_json(self.json_path, data)
+    
+    def load_model_data(self) -> Optional[Dict]:
+        """
+        Load model data from JSON file
+        """
+        try:
+            if self.json_path.exists():
+                with self.json_path.open('r') as f:
+                    return json.load(f)
+        except Exception as e:
+            logger.error(f"Error loading model data: {e}")
+        return None
+    
+    def create_backup(self, prefix: str = "backup"):
+        """
+        Create backup of current data files
+        """
+        timestamp = int(time.time())
+        
+        # Backup CSV
+        if self.csv_path.exists():
+            csv_backup = self.backup_dir / f"{prefix}_data_{timestamp}.csv"
+            import shutil
+            shutil.copy2(self.csv_path, csv_backup)
+            logger.info(f"Created CSV backup: {csv_backup}")
+        
+        # Backup JSON
+        if self.json_path.exists():
+            json_backup = self.backup_dir / f"{prefix}_model_{timestamp}.json"
+            shutil.copy2(self.json_path, json_backup)
+            logger.info(f"Created JSON backup: {json_backup}")
+    
+    def maintain_dataset_size(self, max_records: int = 10000):
+        """
+        Maintain dataset size by archiving old records
+        """
+        try:
+            # Count CSV records
+            with self.csv_path.open('r') as f:
+                reader = csv.reader(f)
+                records = list(reader)
+            
+            if len(records) > max_records + 1:  # +1 for header
+                # Archive old records
+                archive_file = self.backup_dir / f"archive_{int(time.time())}.csv"
+                
+                with archive_file.open('w', newline='') as f:
+                    writer = csv.writer(f)
+                    # Write header and old records
+                    writer.writerow(records[0])
+                    writer.writerows(records[1:len(records)-max_records])
+                
+                # Rewrite main file with recent records
+                with self.csv_path.open('w', newline='') as f:
+                    writer = csv.writer(f)
+                    writer.writerow(records[0])
+                    writer.writerows(records[-max_records:])
+                
+                logger.info(f"Archived {len(records)-max_records-1} old records")
+        except Exception as e:
+            logger.error(f"Error maintaining dataset size: {e}")
+    
+    def get_statistics(self) -> Dict:
+        """
+        Get storage statistics
+        """
+        stats = {
+            'data_path': str(self.data_path),
+            'csv_file': str(self.csv_path),
+            'csv_exists': self.csv_path.exists(),
+            'csv_size': 0,
+            'csv_records': 0,
+            'json_file': str(self.json_path),
+            'json_exists': self.json_path.exists(),
+            'json_size': 0,
+            'backup_count': 0
+        }
+        
+        try:
+            if self.csv_path.exists():
+                stats['csv_size'] = self.csv_path.stat().st_size
+                with self.csv_path.open('r') as f:
+                    stats['csv_records'] = sum(1 for _ in f) - 1  # Subtract header
+            
+            if self.json_path.exists():
+                stats['json_size'] = self.json_path.stat().st_size
+            
+            if self.backup_dir.exists():
+                stats['backup_count'] = len(list(self.backup_dir.glob('*')))
+        except Exception as e:
+            logger.error(f"Error getting statistics: {e}")
+        
+        return stats
+
+# Initialize storage manager globally
+storage_manager = DataStorageManager()
+
+# ═══════════════════════════  Physical Constants  ═══════════════════════════════
 
 @dataclass
 class PhysicalConstants:
@@ -73,7 +354,7 @@ class PhysicalConstants:
 
 PHYSICS = PhysicalConstants()
 
-# ════════════════════════════════  Wheel Configuration  ════════════════════════════════
+# ═══════════════════════════  Wheel Configuration  ══════════════════════════════
 
 EUROPEAN_WHEEL = [
     0, 32, 15, 19, 4, 21, 2, 25, 17, 34, 6, 27,
@@ -90,7 +371,7 @@ POCKET_INDICES = {
     num: i for i, num in enumerate(EUROPEAN_WHEEL)
 }
 
-# ════════════════════════════════  Data Models  ════════════════════════════════════════
+# ═══════════════════════════  Data Models  ═══════════════════════════════════════
 
 class BallState(BaseModel):
     """Complete state of the ball at a given time"""
@@ -123,11 +404,9 @@ class PredictionRequest(BaseModel):
     ts_start: Optional[int] = None
 
 class LogWinnerRequest(BaseModel):
-    """Log winning result"""
+    """Request to log winning number"""
     round_id: str
     winning_number: int
-    timestamp: Optional[int] = None
-    predicted_number: Optional[int] = None
     
 class CalibrationData(BaseModel):
     """Calibration parameters for specific wheel"""
@@ -144,44 +423,7 @@ class CalibrationData(BaseModel):
     sample_count: int = 0
     last_updated: float = Field(default_factory=time.time)
 
-# ════════════════════════════════  File Management (Fixed)  ════════════════════════════
-
-def get_data_path() -> str:
-    """Get the best available path for data storage"""
-    # Try multiple paths in order of preference
-    candidates = [
-        os.getenv("ROULETTE_DATA_PATH", ""),
-        os.path.join(os.path.expanduser("~"), ".roulette_predictor", "roulette_dataset_v4.json"),
-        os.path.join("/tmp", "roulette_dataset_v4.json"),
-        os.path.join(".", "roulette_dataset_v4.json")
-    ]
-    
-    for path in candidates:
-        if not path:
-            continue
-            
-        dir_path = os.path.dirname(path)
-        if dir_path and dir_path != ".":
-            try:
-                os.makedirs(dir_path, exist_ok=True)
-            except:
-                continue
-                
-        try:
-            # Test if we can write to this location
-            with open(path, 'a'):
-                pass
-            return path
-        except:
-            continue
-            
-    # Fallback to current directory
-    return "roulette_dataset_v4.json"
-
-DATA_FILE = get_data_path()
-logger.info(f"Data file location: {DATA_FILE}")
-
-# ════════════════════════════════  Advanced Physics Engine  ════════════════════════════
+# ═══════════════════════════  Advanced Physics Engine  ══════════════════════════
 
 class AdvancedPhysicsEngine:
     """
@@ -380,7 +622,7 @@ class AdvancedPhysicsEngine:
             'track_time': 3.0
         }
 
-# ════════════════════════════════  Deflector & Bounce Model  ══════════════════════════
+# ═══════════════════════════  Deflector & Bounce Model  ════════════════════════
 
 class DeflectorCollisionModel:
     """
@@ -462,7 +704,7 @@ class DeflectorCollisionModel:
         
         return distribution
 
-# ════════════════════════════════  Machine Learning Component  ═════════════════════════
+# ═══════════════════════════  Machine Learning Component  ═══════════════════════
 
 class AdaptiveLearningSystem:
     """
@@ -568,7 +810,7 @@ class AdaptiveLearningSystem:
             
         return offset
 
-# ════════════════════════════════  Intelligent Calibration  ════════════════════════════
+# ═══════════════════════════  Intelligent Calibration  ══════════════════════════
 
 class IntelligentCalibrationSystem:
     """
@@ -673,7 +915,6 @@ class IntelligentCalibrationSystem:
         ]
         
         # Optimize
-        from scipy.optimize import minimize
         result = minimize(objective, x0, method='L-BFGS-B', bounds=bounds)
         
         if result.success:
@@ -682,7 +923,7 @@ class IntelligentCalibrationSystem:
             self.current_calibration.bounce_randomness = result.x[2]
             logger.info("Parameter optimization successful")
 
-# ════════════════════════════════  Main Prediction System  ═════════════════════════════
+# ═══════════════════════════  Main Prediction System  ═══════════════════════════
 
 class ProfessionalRoulettePredictor:
     """
@@ -697,8 +938,6 @@ class ProfessionalRoulettePredictor:
         
         self.prediction_history = []
         self.dataset = []
-        self.max_efficiency_reached = False
-        self.best_accuracy = 0.0
         
     def predict(self, crossings: List[CrossingData], direction: str) -> Dict[str, Any]:
         """
@@ -741,10 +980,10 @@ class ProfessionalRoulettePredictor:
             }
             ml_correction = self.learning_system.predict_correction(features)
         
-        # Generate scatter predictions (НЕ соседние номера, а физически рассчитанные!)
+        # Generate scatter predictions
         scatter_distribution = deflector_effect['scatter_distribution']
         
-        # Top 4 most likely pockets based on physics
+        # Top 4 most likely pockets
         scatter_distribution.sort(key=lambda x: x[1], reverse=True)
         jump_numbers = []
         
@@ -846,11 +1085,6 @@ class ProfessionalRoulettePredictor:
         predicted = prediction_data['predicted_number']
         offset = self._calculate_offset(predicted, winning_number)
         
-        # АНАЛИЗ ТОЧНОСТИ - выводим статистику после каждого результата
-        direct_hit = (offset == 0)
-        within_3 = abs(offset) <= 3
-        within_5 = abs(offset) <= 5
-        
         # Update learning system
         features = {
             'omega_ball': prediction_data.get('omega_ball', 0),
@@ -885,26 +1119,7 @@ class ProfessionalRoulettePredictor:
                     self.calibration_system.current_calibration
                 )
         
-        # УМНОЕ УПРАВЛЕНИЕ ДАННЫМИ
-        # Проверяем, нужно ли добавлять данные
-        current_accuracy = self._calculate_current_accuracy()
-        
-        # Если достигли 1000 записей
-        if len(self.dataset) >= 1000:
-            if current_accuracy >= self.best_accuracy:
-                # Эффективность максимальная - не записываем новые данные
-                self.max_efficiency_reached = True
-                logger.info(f"Maximum efficiency reached: {current_accuracy:.1%}. Data collection paused.")
-                
-                # Выводим анализ точности
-                self._print_accuracy_analysis(offset, winning_number, predicted)
-                return
-            else:
-                # Эффективность упала - удаляем худшие данные и добавляем новые
-                self._remove_worst_predictions()
-                logger.info(f"Efficiency dropped to {current_accuracy:.1%}. Optimizing dataset...")
-        
-        # Store in dataset только если нужно
+        # Store in dataset
         self.dataset.append({
             'round_id': round_id,
             'predicted': predicted,
@@ -914,77 +1129,34 @@ class ProfessionalRoulettePredictor:
             **features
         })
         
-        # Update best accuracy
-        if current_accuracy > self.best_accuracy:
-            self.best_accuracy = current_accuracy
-        
-        # Выводим анализ точности
-        self._print_accuracy_analysis(offset, winning_number, predicted)
+        # Write to CSV
+        csv_record = {
+            'timestamp': time.time(),
+            'round_id': round_id,
+            'predicted_number': predicted,
+            'actual_number': winning_number,
+            'offset': offset,
+            'confidence': prediction_data.get('confidence', 0),
+            'omega_ball': features['omega_ball'],
+            'alpha_ball': features['alpha_ball'],
+            'omega_wheel': features['omega_wheel'],
+            'impact_velocity': features['impact_velocity'],
+            'impact_angle': features['impact_angle'],
+            'rim_time': features['rim_time'],
+            'track_time': features['track_time'],
+            'ml_correction': prediction_data.get('ml_correction', 0),
+            'calibration_confidence': self.calibration_system.current_calibration.confidence,
+            'result': 'HIT' if abs(offset) <= 3 else 'MISS'
+        }
+        storage_manager.append_csv_record(csv_record)
         
         # Maintain dataset size
         if len(self.dataset) > 1000:
             self.dataset = self.dataset[-1000:]
-    
-    def _print_accuracy_analysis(self, offset: int, actual: int, predicted: int):
-        """Вывод анализа точности в консоль"""
-        total = len(self.dataset)
-        if total == 0:
-            return
-        
-        # Calculate statistics
-        direct_hits = sum(1 for d in self.dataset if d['offset'] == 0)
-        within_1 = sum(1 for d in self.dataset if abs(d['offset']) <= 1)
-        within_3 = sum(1 for d in self.dataset if abs(d['offset']) <= 3)
-        within_5 = sum(1 for d in self.dataset if abs(d['offset']) <= 5)
-        
-        # Recent performance (last 50)
-        recent = self.dataset[-50:] if len(self.dataset) >= 50 else self.dataset
-        recent_within_3 = sum(1 for d in recent if abs(d['offset']) <= 3)
-        
-        # Average error
-        avg_error = np.mean([abs(d['offset']) for d in self.dataset])
-        
-        # Print analysis
-        logger.info("="*60)
-        logger.info(f"ACCURACY ANALYSIS - Dataset: {total} predictions")
-        logger.info(f"Current: Predicted {predicted}, Actual {actual}, Error: {offset} pockets")
-        logger.info(f"Direct hits: {direct_hits}/{total} ({direct_hits/total*100:.1f}%)")
-        logger.info(f"Within ±1: {within_1}/{total} ({within_1/total*100:.1f}%)")
-        logger.info(f"Within ±3: {within_3}/{total} ({within_3/total*100:.1f}%)")
-        logger.info(f"Within ±5: {within_5}/{total} ({within_5/total*100:.1f}%)")
-        logger.info(f"Average error: {avg_error:.1f} pockets")
-        logger.info(f"Recent performance (last 50): {recent_within_3/len(recent)*100:.1f}% within ±3")
-        
-        # Data quality status
-        if self.max_efficiency_reached:
-            logger.info("STATUS: Maximum efficiency reached - data collection PAUSED")
-        else:
-            logger.info(f"STATUS: Collecting data - current efficiency {self._calculate_current_accuracy():.1%}")
-        logger.info("="*60)
-    
-    def _calculate_current_accuracy(self) -> float:
-        """Calculate current prediction accuracy"""
-        if not self.dataset:
-            return 0.0
-        
-        recent = self.dataset[-100:] if len(self.dataset) >= 100 else self.dataset
-        within_3 = sum(1 for d in recent if abs(d['offset']) <= 3)
-        return within_3 / len(recent)
-    
-    def _remove_worst_predictions(self):
-        """Remove worst predictions to improve dataset quality"""
-        if len(self.dataset) < 100:
-            return
-        
-        # Sort by absolute offset (worst first)
-        sorted_data = sorted(self.dataset, key=lambda x: abs(x['offset']), reverse=True)
-        
-        # Remove worst 10%
-        remove_count = len(self.dataset) // 10
-        self.dataset = sorted_data[remove_count:]
-        
-        # Re-sort by timestamp
-        self.dataset.sort(key=lambda x: x['timestamp'])
+            
+        # Maintain file size
+        if len(self.dataset) % 100 == 0:
+            storage_manager.maintain_dataset_size()
     
     def _calculate_offset(self, predicted: int, actual: int) -> int:
         """Calculate signed offset"""
@@ -1042,15 +1214,10 @@ class ProfessionalRoulettePredictor:
                 'trained': self.learning_system.is_trained,
                 'confidence': round(self.learning_system.get_confidence() * 100, 1),
                 'samples': len(self.learning_system.training_data)
-            },
-            'data_collection': {
-                'status': 'PAUSED' if self.max_efficiency_reached else 'ACTIVE',
-                'max_efficiency': self.max_efficiency_reached,
-                'best_accuracy': f"{self.best_accuracy:.1%}"
             }
         }
 
-# ════════════════════════════════  FastAPI Server  ═════════════════════════════════════
+# ═══════════════════════════  FastAPI Server  ═══════════════════════════════════
 
 app = FastAPI(
     title="Professional Roulette Prediction Server",
@@ -1070,68 +1237,68 @@ app.add_middleware(
 predictor = ProfessionalRoulettePredictor()
 pending_predictions = {}
 
-# Data persistence
 def load_dataset():
     """Load dataset from file"""
-    if os.path.exists(DATA_FILE):
-        try:
-            with open(DATA_FILE, 'r') as f:
-                data = json.load(f)
-                predictor.dataset = data.get('dataset', [])
-                predictor.learning_system.training_data = data.get('training', [])
-                
-                # Recalibrate from loaded data
-                if len(predictor.dataset) >= 20:
-                    predictor.calibration_system.auto_calibrate(predictor.dataset)
-                
-                # Calculate best accuracy
-                if predictor.dataset:
-                    predictor.best_accuracy = predictor._calculate_current_accuracy()
-                
-                logger.info(f"Loaded {len(predictor.dataset)} records from file")
-        except Exception as e:
-            logger.error(f"Error loading dataset: {e}")
+    data = storage_manager.load_model_data()
+    if data:
+        predictor.dataset = data.get('dataset', [])
+        predictor.learning_system.training_data = data.get('training', [])
+        
+        # Load calibration
+        if 'calibration' in data and data['calibration']:
+            calib_data = data['calibration']
+            predictor.calibration_system.current_calibration = CalibrationData(**calib_data)
+        
+        # Recalibrate from loaded data
+        if len(predictor.dataset) >= 20:
+            predictor.calibration_system.auto_calibrate(predictor.dataset)
+        
+        logger.info(f"Loaded {len(predictor.dataset)} records from file")
 
 def save_dataset():
     """Save dataset to file"""
-    try:
-        data = {
-            'dataset': predictor.dataset[-1000:],  # Keep last 1000
-            'training': predictor.learning_system.training_data[-500:],  # Keep last 500
-            'calibration': predictor.calibration_system.current_calibration.dict()
-        }
-        
-        with open(DATA_FILE, 'w') as f:
-            json.dump(data, f)
-            
-        logger.info(f"Saved {len(predictor.dataset)} records to file")
-    except Exception as e:
-        logger.error(f"Error saving dataset: {e}")
+    data = {
+        'version': '4.0',
+        'timestamp': time.time(),
+        'dataset': predictor.dataset[-1000:],  # Keep last 1000
+        'training': predictor.learning_system.training_data[-500:],  # Keep last 500
+        'calibration': predictor.calibration_system.current_calibration.dict(),
+        'statistics': predictor.get_statistics()
+    }
+    
+    storage_manager.save_model_data(data)
+    logger.info(f"Saved {len(predictor.dataset)} records to file")
 
 @app.on_event("startup")
 async def startup():
     """Initialize server"""
     load_dataset()
     
+    # Get storage statistics
+    storage_stats = storage_manager.get_statistics()
+    
     stats = predictor.get_statistics()
     logger.info("=" * 60)
     logger.info("Professional Roulette Prediction Server Started")
+    logger.info(f"Data Path: {storage_stats['data_path']}")
+    logger.info(f"CSV File: {storage_stats['csv_file']}")
     logger.info(f"Dataset: {stats['total_predictions']} predictions")
     logger.info(f"Calibration: {stats['calibration']['status']}")
     logger.info(f"ML Model: {'TRAINED' if stats['ml_model']['trained'] else 'LEARNING'}")
-    logger.info(f"Data Collection: {stats['data_collection']['status']}")
     logger.info("=" * 60)
 
 @app.on_event("shutdown")
 async def shutdown():
     """Save data on shutdown"""
     save_dataset()
-    logger.info("Server shutdown - data saved")
+    storage_manager.create_backup("shutdown")
+    logger.info("Server shutdown - data saved and backed up")
 
 @app.get("/")
 async def root():
     """Server status and statistics"""
     stats = predictor.get_statistics()
+    storage_stats = storage_manager.get_statistics()
     
     return {
         "server": "Professional Roulette Prediction Server v4.0",
@@ -1139,13 +1306,15 @@ async def root():
         "physics_model": "Small & Tse (2012) Enhanced",
         "machine_learning": "RandomForest with AutoML",
         "statistics": stats,
+        "storage": storage_stats,
         "capabilities": {
             "auto_calibration": True,
             "adaptive_learning": True,
             "physics_simulation": "Full Navier-Stokes",
             "deflector_modeling": "Energy-based with scatter",
             "confidence_estimation": True,
-            "smart_data_management": True
+            "data_persistence": True,
+            "automatic_backup": True
         }
     }
 
@@ -1169,7 +1338,6 @@ async def predict(request: PredictionRequest):
         # Log
         logger.info(f"Prediction generated: {result['predicted_number']} "
                    f"(confidence: {result['confidence']:.1%})")
-        logger.info(f"Jump numbers (physics-based): {result['jump_numbers']}")
         
         return {
             "predicted_number": result['predicted_number'],
@@ -1206,6 +1374,10 @@ async def log_winner(request: LogWinnerRequest):
         if len(predictor.dataset) % 10 == 0:
             save_dataset()
         
+        # Create backup periodically
+        if len(predictor.dataset) % 100 == 0:
+            storage_manager.create_backup("periodic")
+        
         # Calculate result
         offset = predictor._calculate_offset(
             prediction_data['predicted_number'],
@@ -1221,8 +1393,7 @@ async def log_winner(request: LogWinnerRequest):
         return {
             "result": result,
             "offset": offset,
-            "statistics": stats,
-            "data_status": stats['data_collection']['status']
+            "statistics": stats
         }
         
     except Exception as e:
@@ -1252,6 +1423,11 @@ async def get_calibration():
         }
     }
 
+@app.get("/storage")
+async def get_storage_info():
+    """Get storage system information"""
+    return storage_manager.get_statistics()
+
 if __name__ == "__main__":
     import uvicorn
     
@@ -1264,7 +1440,7 @@ if __name__ == "__main__":
     print("  • Progressive machine learning")
     print("  • Deflector collision modeling")
     print("  • Statistical confidence estimation")
-    print("  • Smart data management (auto-pause at max efficiency)")
+    print("  • Advanced data persistence system")
     print("="*70 + "\n")
     
     uvicorn.run(app, host="0.0.0.0", port=5000)
