@@ -1237,6 +1237,11 @@ async def root():
         }
     }
 
+@app.get("/health")
+async def health():
+    """Health check endpoint"""
+    return {"status": "ok", "service": "roulette-predictor"}
+
 @app.post("/predict")
 async def predict(request: PredictionRequest):
     """Generate prediction - FIXED FORMAT"""
@@ -1378,4 +1383,4 @@ if __name__ == "__main__":
     print(f"Data storage: {DATA_PATH}")
     print("="*70 + "\n")
     
-    uvicorn.run(app, host="0.0.0.0", port=5000)
+    uvicorn.run(app, host="0.0.0.0", port=8000)
