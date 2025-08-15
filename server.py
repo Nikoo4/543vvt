@@ -36,7 +36,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger("RoulettePredictor")
 
-# ═══════════════════════════  CSV Data Management  ═══════════════════════════════
+# ╔══════════════════════════  CSV Data Management  ═══════════════════════════╗
 
 # CSV column definitions
 CSV_COLUMNS = [
@@ -185,7 +185,7 @@ def maintain_dataset_size(max_size: int = 10000):
     except Exception as e:
         logger.error(f"Error maintaining dataset size: {e}")
 
-# ═══════════════════════════  Physical Constants  ═══════════════════════════════
+# ╔══════════════════════════  Physical Constants  ═══════════════════════════╗
 
 @dataclass
 class PhysicalConstants:
@@ -223,7 +223,7 @@ class PhysicalConstants:
 
 PHYSICS = PhysicalConstants()
 
-# ═══════════════════════════  Wheel Configuration  ══════════════════════════════
+# ╔══════════════════════════  Wheel Configuration  ══════════════════════════╗
 
 EUROPEAN_WHEEL = [
     0, 32, 15, 19, 4, 21, 2, 25, 17, 34, 6, 27,
@@ -240,7 +240,7 @@ POCKET_INDICES = {
     num: i for i, num in enumerate(EUROPEAN_WHEEL)
 }
 
-# ═══════════════════════════  Data Models  ═══════════════════════════════════════
+# ╔══════════════════════════  Data Models  ══════════════════════════════════╗
 
 class BallState(BaseModel):
     """Complete state of the ball at a given time"""
@@ -257,19 +257,20 @@ class WheelState(BaseModel):
     omega: float = Field(..., description="Angular velocity (rad/s)")
     alpha: float = Field(0.0, description="Angular acceleration (rad/s²)")
 
-class CrossingData(BaseModel):
+# ИСПРАВЛЕНО: Используем модель данных из server_7.py
+class Crossing(BaseModel):
     """Ball crossing detection data"""
     idx: int
     t: float
     theta: float
-    phi: float
     slot: Optional[int] = None
+    phi: float
 
 class PredictionRequest(BaseModel):
     """Request for prediction"""
-    crossings: List[CrossingData]
-    direction: str = Field("cw", pattern="^(cw|ccw)$")
-    theta_zero: float = Field(0.0)
+    crossings: List[Crossing]
+    direction: str
+    theta_zero: float
     ts_start: Optional[int] = None
 
 class LogWinnerRequest(BaseModel):
@@ -277,6 +278,7 @@ class LogWinnerRequest(BaseModel):
     round_id: str
     winning_number: int = Field(..., ge=0, le=36)
     timestamp: Optional[float] = None
+    predicted_number: Optional[int] = None
     
 class CalibrationData(BaseModel):
     """Calibration parameters for specific wheel"""
@@ -293,7 +295,7 @@ class CalibrationData(BaseModel):
     sample_count: int = 0
     last_updated: float = Field(default_factory=time.time)
 
-# ═══════════════════════════  Advanced Physics Engine  ══════════════════════════
+# ╔══════════════════════════  Advanced Physics Engine  ══════════════════════╗
 
 class AdvancedPhysicsEngine:
     """
@@ -492,7 +494,7 @@ class AdvancedPhysicsEngine:
             'track_time': 3.0
         }
 
-# ═══════════════════════════  Deflector & Bounce Model  ════════════════════════
+# ╔══════════════════════════  Deflector & Bounce Model  ═════════════════════╗
 
 class DeflectorCollisionModel:
     """
@@ -575,7 +577,7 @@ class DeflectorCollisionModel:
         
         return distribution
 
-# ═══════════════════════════  Machine Learning Component  ═══════════════════════
+# ╔══════════════════════════  Machine Learning Component  ═══════════════════╗
 
 class AdaptiveLearningSystem:
     """
@@ -681,7 +683,7 @@ class AdaptiveLearningSystem:
             
         return offset
 
-# ═══════════════════════════  Intelligent Calibration  ══════════════════════════
+# ╔══════════════════════════  Intelligent Calibration  ══════════════════════╗
 
 class IntelligentCalibrationSystem:
     """
@@ -748,9 +750,9 @@ class IntelligentCalibrationSystem:
         # Optimize using observed outcomes
         if len(observations) >= 50:
             self._optimize_parameters(observations)
-        
+            
         logger.info(f"Calibration complete: tilt={math.degrees(estimated_tilt):.2f}°, "
-                   f"friction={estimated_friction:.4f}")
+                     f"friction={estimated_friction:.4f}")
         
         return True
     
@@ -798,7 +800,7 @@ class IntelligentCalibrationSystem:
         except Exception as e:
             logger.warning(f"Optimization failed: {e}")
 
-# ═══════════════════════════  Main Prediction System  ═══════════════════════════
+# ╔══════════════════════════  Main Prediction System  ═══════════════════════╗
 
 class ProfessionalRoulettePredictor:
     """
@@ -814,7 +816,7 @@ class ProfessionalRoulettePredictor:
         self.prediction_history = []
         self.dataset = []
         
-    def predict(self, crossings: List[CrossingData], direction: str) -> Dict[str, Any]:
+    def predict(self, crossings: List[Crossing], direction: str) -> Dict[str, Any]:
         """
         Generate prediction using full physics + ML pipeline
         """
@@ -892,36 +894,41 @@ class ProfessionalRoulettePredictor:
         
         return result
     
-    def _analyze_crossings(self, crossings: List[CrossingData]) -> Dict[str, float]:
-        """Extract physics parameters from crossings"""
-        times = np.array([c.t for c in crossings])
-        ball_angles = np.array([c.theta for c in crossings])
-        wheel_angles = np.array([c.phi for c in crossings])
+    def _analyze_crossings(self, crossings: List[Crossing]) -> Dict[str, float]:
+        """Extract physics parameters from crossings - FIXED VERSION"""
+        times = [c.t for c in crossings]
+        ball_angles = [c.theta for c in crossings]
+        wheel_angles = [c.phi for c in crossings]
         
-        # Smooth data using Savitzky-Golay filter
-        if len(times) >= 5:
-            ball_angles = savgol_filter(ball_angles, min(5, len(times)), 2)
-        
-        # Calculate velocities using central differences
-        dt = np.diff(times)
-        d_ball = np.diff(ball_angles)
-        d_wheel = np.diff(wheel_angles)
-        
-        omega_ball = np.mean(d_ball / dt) if len(dt) > 0 else 0
-        omega_wheel = np.mean(d_wheel / dt) if len(dt) > 0 else 0
-        
-        # Calculate acceleration
-        if len(dt) >= 2:
-            omega_ball_series = d_ball / dt
-            alpha_ball = np.mean(np.diff(omega_ball_series) / dt[1:])
+        # БЕЗОПАСНЫЙ расчет из server_7.py
+        if len(times) >= 2:
+            dt1 = times[1] - times[0]
+            dt2 = times[2] - times[1] if len(times) > 2 else dt1
+            
+            omega_ball_1 = (ball_angles[1] - ball_angles[0]) / dt1
+            omega_ball_2 = (ball_angles[2] - ball_angles[1]) / dt2 if len(times) > 2 else omega_ball_1
+            omega_ball = (omega_ball_1 + omega_ball_2) / 2
+            
+            # Безопасный расчет ускорения
+            if len(times) > 2:
+                alpha_ball = (omega_ball_2 - omega_ball_1) / ((dt1 + dt2) / 2)
+            else:
+                alpha_ball = -0.5  # Default deceleration
         else:
-            alpha_ball = -2.0  # Default deceleration
+            omega_ball = 0.0
+            alpha_ball = -0.5
+        
+        # Wheel velocity
+        if len(times) > 1:
+            omega_wheel = (wheel_angles[-1] - wheel_angles[0]) / (times[-1] - times[0])
+        else:
+            omega_wheel = 0.0
         
         return {
             'omega_ball': omega_ball,
             'alpha_ball': alpha_ball,
             'omega_wheel': omega_wheel,
-            'alpha_wheel': 0.0  # Assume constant wheel speed
+            'alpha_wheel': 0.0
         }
     
     def _calculate_confidence(self, simulation: Dict, deflector: Dict) -> float:
@@ -1088,7 +1095,7 @@ class ProfessionalRoulettePredictor:
             }
         }
 
-# ═══════════════════════════  FastAPI Server  ═══════════════════════════════════
+# ╔══════════════════════════  FastAPI Server  ═══════════════════════════════╗
 
 app = FastAPI(
     title="Professional Roulette Prediction Server",
@@ -1107,6 +1114,65 @@ app.add_middleware(
 # Initialize main predictor
 predictor = ProfessionalRoulettePredictor()
 pending_predictions = {}
+
+# Performance tracking (from server_7)
+from collections import deque
+
+class PerformanceTracker:
+    """Track prediction accuracy and improvement"""
+    
+    def __init__(self):
+        self.reset_metrics()
+    
+    def reset_metrics(self):
+        self.total_predictions = 0
+        self.direct_hits = 0
+        self.jump_hits = 0
+        self.error_history = deque(maxlen=50)
+        self.improvement_baseline = None
+    
+    def update(self, predicted: int, jumps: List[int], actual: int):
+        """Update metrics with new result"""
+        self.total_predictions += 1
+        
+        # Check hits
+        if predicted == actual:
+            self.direct_hits += 1
+        if actual in jumps:
+            self.jump_hits += 1
+        
+        # Calculate error
+        pred_idx = POCKET_INDICES[predicted]
+        actual_idx = POCKET_INDICES[actual]
+        error = abs((actual_idx - pred_idx) % 37)
+        if error > 18:
+            error = 37 - error
+        
+        self.error_history.append(error)
+        
+        # Set baseline after first 20 predictions
+        if self.total_predictions == 20:
+            self.improvement_baseline = self.get_average_error()
+    
+    def get_average_error(self) -> float:
+        """Get average prediction error"""
+        if not self.error_history:
+            return float('inf')
+        return sum(self.error_history) / len(self.error_history)
+    
+    def get_improvement_percentage(self) -> float:
+        """Calculate improvement from baseline"""
+        if not self.improvement_baseline or self.total_predictions < 30:
+            return 0.0
+        
+        current_error = self.get_average_error()
+        if self.improvement_baseline == 0:
+            return 0.0
+        
+        improvement = (self.improvement_baseline - current_error) / self.improvement_baseline * 100
+        return max(0, improvement)
+
+performance_tracker = PerformanceTracker()
 
 def initialize_csv():
     """
@@ -1173,9 +1239,9 @@ async def root():
 
 @app.post("/predict")
 async def predict(request: PredictionRequest):
-    """Generate prediction"""
+    """Generate prediction - FIXED FORMAT"""
     try:
-        # Generate prediction
+        # Generate prediction using advanced physics
         result = predictor.predict(request.crossings, request.direction)
         
         # Generate unique ID
@@ -1188,31 +1254,39 @@ async def predict(request: PredictionRequest):
             'timestamp': time.time()
         }
         
+        # Calculate metrics for response (like server_7)
+        avg_error = performance_tracker.get_average_error()
+        improvement = performance_tracker.get_improvement_percentage()
+        
         # Log
         logger.info(f"Prediction generated: {result['predicted_number']} "
                    f"(confidence: {result['confidence']:.1%})")
         
+        # ИСПРАВЛЕННЫЙ ФОРМАТ ОТВЕТА (как в server_7.py)
         return {
-            "predicted_number": result['predicted_number'],
-            "dataset_rows": len(predictor.dataset),
-            "jump_numbers": result['jump_numbers'],
+            "ok": True,
             "round_id": round_id,
-            "accuracy": result['confidence'],
-            "data_quality": f"{result['confidence']:.0%}",
-            **result
+            "prediction": result['predicted_number'],  # Название поля из server_7
+            "jump_numbers": result['jump_numbers'],
+            "accuracy": {
+                "error_margin": int(avg_error) if avg_error != float('inf') else "N/A",
+                "improvement": round(improvement, 1)
+            },
+            "dataset_rows": len(predictor.dataset),
+            "data_quality": f"{result['confidence']*100:.0f}%"
         }
         
     except Exception as e:
         logger.error(f"Prediction error: {e}")
-        raise HTTPException(status_code=400, detail=str(e))
+        return {"ok": False, "error": str(e)}
 
 @app.post("/log_winner")
 async def log_winner(request: LogWinnerRequest):
-    """Log actual outcome"""
+    """Log actual outcome - FIXED FORMAT"""
     try:
         # Get prediction data
         if request.round_id not in pending_predictions:
-            return {"error": "Round ID not found"}
+            return {"ok": True, "ignored": True, "reason": "no_matching_prediction"}
         
         prediction_data = pending_predictions.pop(request.round_id)
         
@@ -1223,27 +1297,46 @@ async def log_winner(request: LogWinnerRequest):
             prediction_data
         )
         
+        # Update performance tracker
+        performance_tracker.update(
+            prediction_data['predicted_number'],
+            prediction_data['jump_numbers'],
+            request.winning_number
+        )
+        
         # Calculate result
         offset = predictor._calculate_offset(
             prediction_data['predicted_number'],
             request.winning_number
         )
         
+        # Determine hit type
+        if request.winning_number == prediction_data['predicted_number']:
+            pattern = "direct_hit"
+        elif request.winning_number in prediction_data['jump_numbers']:
+            pattern = "jump_hit"
+        else:
+            pattern = f"miss_{abs(offset)}"
+        
         result = "HIT" if abs(offset) <= 3 else "MISS"
         
         logger.info(f"Outcome logged: {result} (offset: {offset})")
         
-        stats = predictor.get_statistics()
-        
+        # ИСПРАВЛЕННЫЙ ФОРМАТ ОТВЕТА (как в server_7.py)
         return {
-            "result": result,
-            "offset": offset,
-            "statistics": stats
+            "ok": True,
+            "stored": True,
+            "hit_type": pattern,
+            "error_slots": abs(offset),
+            "current_accuracy": {
+                "average_error": round(performance_tracker.get_average_error(), 1),
+                "improvement": round(performance_tracker.get_improvement_percentage(), 1)
+            }
         }
         
     except Exception as e:
         logger.error(f"Error logging winner: {e}")
-        raise HTTPException(status_code=400, detail=str(e))
+        return {"ok": False, "error": str(e)}
 
 @app.get("/calibration")
 async def get_calibration():
