@@ -15,7 +15,7 @@ from collections import deque, defaultdict
 from typing import List, Dict, Any, Optional, Tuple, Union
 from dataclasses import dataclass, field
 from enum import Enum
-from pathlib import Path
+from datetime import datetime
 
 import numpy as np
 from scipy.integrate import solve_ivp, odeint
@@ -36,285 +36,154 @@ logging.basicConfig(
 )
 logger = logging.getLogger("RoulettePredictor")
 
-# ═══════════════════════════  Data Storage System  ═══════════════════════════════
+# ═══════════════════════════  CSV Data Management  ═══════════════════════════════
 
-class DataStorageManager:
+# CSV column definitions
+CSV_COLUMNS = [
+    'timestamp', 'round_id', 'predicted_number', 'actual_number', 
+    'offset', 'confidence', 'omega_ball', 'alpha_ball', 'omega_wheel',
+    'impact_velocity', 'rim_time', 'track_time', 'ml_correction',
+    'calibration_confidence', 'within_3', 'within_5'
+]
+
+def get_data_path() -> str:
     """
-    Advanced file management system for roulette data
-    Handles creation, validation, and maintenance of data files
+    Determine the best available path for data storage
+    Priority: ENV > user_home > /tmp > current_dir
     """
+    # Check environment variable first
+    env_path = os.environ.get('ROULETTE_DATA_PATH')
+    if env_path:
+        return try_path(env_path)
     
-    def __init__(self):
-        self.data_path = self._initialize_data_path()
-        self.csv_path = self._initialize_csv_path()
-        self.json_path = self._initialize_json_path()
-        self.backup_dir = self._initialize_backup_directory()
-        
-    def _initialize_data_path(self) -> Path:
-        """
-        Initialize the main data directory
-        Priority order: environment variable, user home, temp, current directory
-        """
-        # Check environment variable first
-        env_path = os.environ.get('ROULETTE_DATA_PATH')
-        if env_path:
-            path = Path(env_path)
-            if self._try_create_directory(path):
-                logger.info(f"Using environment-specified data path: {path}")
-                return path
-        
-        # Try user home directory
-        home_path = Path.home() / '.roulette_predictor'
-        if self._try_create_directory(home_path):
-            logger.info(f"Using home directory data path: {home_path}")
-            return home_path
-        
-        # Try temp directory
-        temp_path = Path('/tmp') / 'roulette_predictor'
-        if self._try_create_directory(temp_path):
-            logger.info(f"Using temp directory data path: {temp_path}")
-            return temp_path
-        
-        # Fall back to current directory
-        current_path = Path('.') / 'roulette_data'
-        if self._try_create_directory(current_path):
-            logger.info(f"Using current directory data path: {current_path}")
-            return current_path
-        
-        # Last resort - use current directory directly
-        logger.warning("Using current directory for data storage")
-        return Path('.')
+    # Try user home directory
+    home_path = os.path.expanduser('~/.roulette_predictor/roulette_data.csv')
+    if try_path(home_path):
+        return home_path
     
-    def _try_create_directory(self, path: Path) -> bool:
-        """
-        Attempt to create a directory with proper permissions
-        Returns True if successful, False otherwise
-        """
-        try:
-            path.mkdir(parents=True, exist_ok=True)
-            # Test write permissions
-            test_file = path / '.test_write'
-            test_file.touch()
-            test_file.unlink()
-            return True
-        except Exception as e:
-            logger.debug(f"Cannot create/write to directory {path}: {e}")
-            return False
+    # Try /tmp with subdirectory for organization
+    tmp_path = '/tmp/roulette_predictor/roulette_data.csv'
+    if try_path(tmp_path):
+        return tmp_path
     
-    def _initialize_csv_path(self) -> Path:
-        """
-        Initialize CSV file for data logging
-        Creates file with headers if it doesn't exist
-        """
-        csv_file = self.data_path / 'roulette_data.csv'
-        
-        if not csv_file.exists():
-            self._create_csv_with_headers(csv_file)
-            logger.info(f"Created new CSV file: {csv_file}")
-        else:
-            # Validate existing CSV
-            if self._validate_csv_structure(csv_file):
-                logger.info(f"Using existing CSV file: {csv_file}")
-            else:
-                # Backup corrupted file and create new one
-                backup_name = f"roulette_data_backup_{int(time.time())}.csv"
-                backup_path = self.data_path / backup_name
-                csv_file.rename(backup_path)
-                logger.warning(f"Backed up corrupted CSV to {backup_path}")
-                self._create_csv_with_headers(csv_file)
-                logger.info(f"Created new CSV file: {csv_file}")
-        
-        return csv_file
+    # Fallback to current directory
+    local_path = './roulette_data.csv'
+    if try_path(local_path):
+        return local_path
     
-    def _initialize_json_path(self) -> Path:
-        """
-        Initialize JSON file for model persistence
-        """
-        json_file = self.data_path / 'roulette_model.json'
+    # Last resort - use /tmp without subdirectory
+    fallback_path = '/tmp/roulette_data.csv'
+    try_path(fallback_path)
+    return fallback_path
+
+def try_path(path: str) -> bool:
+    """
+    Try to create and initialize a CSV file at the given path
+    Returns True if successful
+    """
+    try:
+        # Create directory if it doesn't exist
+        directory = os.path.dirname(path)
+        if directory and not os.path.exists(directory):
+            os.makedirs(directory, exist_ok=True)
+            logger.info(f"Created directory: {directory}")
         
-        if not json_file.exists():
-            # Create empty JSON structure
-            initial_data = {
-                'version': '4.0',
-                'created': time.time(),
-                'dataset': [],
-                'training': [],
-                'calibration': {},
-                'statistics': {}
-            }
-            self._write_json(json_file, initial_data)
-            logger.info(f"Created new JSON file: {json_file}")
-        
-        return json_file
-    
-    def _initialize_backup_directory(self) -> Path:
-        """
-        Create backup directory for data archiving
-        """
-        backup_dir = self.data_path / 'backups'
-        backup_dir.mkdir(exist_ok=True)
-        return backup_dir
-    
-    def _create_csv_with_headers(self, csv_file: Path):
-        """
-        Create CSV file with proper headers
-        """
-        headers = [
-            'timestamp', 'round_id', 'predicted_number', 'actual_number',
-            'offset', 'confidence', 'omega_ball', 'alpha_ball', 'omega_wheel',
-            'impact_velocity', 'impact_angle', 'rim_time', 'track_time',
-            'ml_correction', 'calibration_confidence', 'result'
-        ]
-        
-        with csv_file.open('w', newline='') as f:
-            writer = csv.writer(f)
-            writer.writerow(headers)
-    
-    def _validate_csv_structure(self, csv_file: Path) -> bool:
-        """
-        Validate that CSV file has correct structure
-        """
-        try:
-            with csv_file.open('r') as f:
+        # Check if file exists and is valid
+        if os.path.exists(path):
+            # Validate existing file
+            with open(path, 'r') as f:
                 reader = csv.reader(f)
                 headers = next(reader, None)
-                if not headers or len(headers) < 10:
-                    return False
-                # Check for essential columns
-                essential = ['timestamp', 'round_id', 'predicted_number', 'actual_number']
-                return all(col in headers for col in essential)
-        except Exception as e:
-            logger.error(f"CSV validation error: {e}")
-            return False
-    
-    def _write_json(self, json_file: Path, data: Dict):
-        """
-        Safely write JSON data with atomic operation
-        """
-        temp_file = json_file.with_suffix('.tmp')
-        try:
-            with temp_file.open('w') as f:
-                json.dump(data, f, indent=2)
-            # Atomic rename
-            temp_file.replace(json_file)
-        except Exception as e:
-            logger.error(f"Error writing JSON: {e}")
-            if temp_file.exists():
-                temp_file.unlink()
-            raise
-    
-    def append_csv_record(self, record: Dict):
-        """
-        Append a record to CSV file with error handling
-        """
-        try:
-            with self.csv_path.open('a', newline='') as f:
-                writer = csv.DictWriter(f, fieldnames=record.keys())
-                writer.writerow(record)
-        except Exception as e:
-            logger.error(f"Error appending to CSV: {e}")
-    
-    def save_model_data(self, data: Dict):
-        """
-        Save model data to JSON file
-        """
-        self._write_json(self.json_path, data)
-    
-    def load_model_data(self) -> Optional[Dict]:
-        """
-        Load model data from JSON file
-        """
-        try:
-            if self.json_path.exists():
-                with self.json_path.open('r') as f:
-                    return json.load(f)
-        except Exception as e:
-            logger.error(f"Error loading model data: {e}")
-        return None
-    
-    def create_backup(self, prefix: str = "backup"):
-        """
-        Create backup of current data files
-        """
-        timestamp = int(time.time())
+                if headers and all(col in headers for col in CSV_COLUMNS[:4]):  # Basic validation
+                    logger.info(f"Using existing CSV file: {path}")
+                    return True
         
-        # Backup CSV
-        if self.csv_path.exists():
-            csv_backup = self.backup_dir / f"{prefix}_data_{timestamp}.csv"
-            import shutil
-            shutil.copy2(self.csv_path, csv_backup)
-            logger.info(f"Created CSV backup: {csv_backup}")
+        # Create new file with headers
+        with open(path, 'w', newline='') as f:
+            writer = csv.DictWriter(f, fieldnames=CSV_COLUMNS)
+            writer.writeheader()
+            logger.info(f"Created new CSV file: {path}")
         
-        # Backup JSON
-        if self.json_path.exists():
-            json_backup = self.backup_dir / f"{prefix}_model_{timestamp}.json"
-            shutil.copy2(self.json_path, json_backup)
-            logger.info(f"Created JSON backup: {json_backup}")
-    
-    def maintain_dataset_size(self, max_records: int = 10000):
-        """
-        Maintain dataset size by archiving old records
-        """
-        try:
-            # Count CSV records
-            with self.csv_path.open('r') as f:
-                reader = csv.reader(f)
-                records = list(reader)
-            
-            if len(records) > max_records + 1:  # +1 for header
-                # Archive old records
-                archive_file = self.backup_dir / f"archive_{int(time.time())}.csv"
-                
-                with archive_file.open('w', newline='') as f:
-                    writer = csv.writer(f)
-                    # Write header and old records
-                    writer.writerow(records[0])
-                    writer.writerows(records[1:len(records)-max_records])
-                
-                # Rewrite main file with recent records
-                with self.csv_path.open('w', newline='') as f:
-                    writer = csv.writer(f)
-                    writer.writerow(records[0])
-                    writer.writerows(records[-max_records:])
-                
-                logger.info(f"Archived {len(records)-max_records-1} old records")
-        except Exception as e:
-            logger.error(f"Error maintaining dataset size: {e}")
-    
-    def get_statistics(self) -> Dict:
-        """
-        Get storage statistics
-        """
-        stats = {
-            'data_path': str(self.data_path),
-            'csv_file': str(self.csv_path),
-            'csv_exists': self.csv_path.exists(),
-            'csv_size': 0,
-            'csv_records': 0,
-            'json_file': str(self.json_path),
-            'json_exists': self.json_path.exists(),
-            'json_size': 0,
-            'backup_count': 0
-        }
+        return True
         
-        try:
-            if self.csv_path.exists():
-                stats['csv_size'] = self.csv_path.stat().st_size
-                with self.csv_path.open('r') as f:
-                    stats['csv_records'] = sum(1 for _ in f) - 1  # Subtract header
-            
-            if self.json_path.exists():
-                stats['json_size'] = self.json_path.stat().st_size
-            
-            if self.backup_dir.exists():
-                stats['backup_count'] = len(list(self.backup_dir.glob('*')))
-        except Exception as e:
-            logger.error(f"Error getting statistics: {e}")
-        
-        return stats
+    except Exception as e:
+        logger.warning(f"Cannot use path {path}: {e}")
+        return False
 
-# Initialize storage manager globally
-storage_manager = DataStorageManager()
+# Initialize data path at module load
+DATA_PATH = get_data_path()
+logger.info(f"Data Path: {os.path.dirname(DATA_PATH)}")
+logger.info(f"CSV File: {DATA_PATH}")
+
+def load_csv_data() -> List[Dict]:
+    """
+    Load existing data from CSV file
+    """
+    data = []
+    try:
+        if os.path.exists(DATA_PATH):
+            with open(DATA_PATH, 'r') as f:
+                reader = csv.DictReader(f)
+                for row in reader:
+                    # Convert numeric fields
+                    for field in ['offset', 'confidence', 'omega_ball', 'alpha_ball', 
+                                 'omega_wheel', 'impact_velocity', 'rim_time', 
+                                 'track_time', 'ml_correction', 'calibration_confidence']:
+                        if field in row and row[field]:
+                            try:
+                                row[field] = float(row[field])
+                            except ValueError:
+                                pass
+                    
+                    # Convert boolean fields
+                    for field in ['within_3', 'within_5']:
+                        if field in row and row[field]:
+                            row[field] = row[field].lower() == 'true'
+                    
+                    data.append(row)
+            
+            logger.info(f"Loaded {len(data)} records from file")
+    except Exception as e:
+        logger.error(f"Error loading CSV data: {e}")
+    
+    return data
+
+def append_csv_record(record: Dict):
+    """
+    Append a single record to CSV file
+    """
+    try:
+        with open(DATA_PATH, 'a', newline='') as f:
+            writer = csv.DictWriter(f, fieldnames=CSV_COLUMNS)
+            
+            # Ensure all columns have values
+            full_record = {col: record.get(col, '') for col in CSV_COLUMNS}
+            writer.writerow(full_record)
+            
+    except Exception as e:
+        logger.error(f"Error appending to CSV: {e}")
+
+def maintain_dataset_size(max_size: int = 10000):
+    """
+    Maintain CSV file size by keeping only the most recent records
+    """
+    try:
+        data = load_csv_data()
+        
+        if len(data) > max_size:
+            # Keep only the most recent records
+            data = data[-max_size:]
+            
+            # Rewrite the file
+            with open(DATA_PATH, 'w', newline='') as f:
+                writer = csv.DictWriter(f, fieldnames=CSV_COLUMNS)
+                writer.writeheader()
+                writer.writerows(data)
+            
+            logger.info(f"Maintained dataset size at {max_size} records")
+            
+    except Exception as e:
+        logger.error(f"Error maintaining dataset size: {e}")
 
 # ═══════════════════════════  Physical Constants  ═══════════════════════════════
 
@@ -404,9 +273,10 @@ class PredictionRequest(BaseModel):
     ts_start: Optional[int] = None
 
 class LogWinnerRequest(BaseModel):
-    """Request to log winning number"""
+    """Request to log the winning number"""
     round_id: str
-    winning_number: int
+    winning_number: int = Field(..., ge=0, le=36)
+    timestamp: Optional[float] = None
     
 class CalibrationData(BaseModel):
     """Calibration parameters for specific wheel"""
@@ -700,7 +570,8 @@ class DeflectorCollisionModel:
         
         # Normalize
         total = sum(p for _, p in distribution)
-        distribution = [(o, p/total) for o, p in distribution]
+        if total > 0:
+            distribution = [(o, p/total) for o, p in distribution]
         
         return distribution
 
@@ -892,13 +763,14 @@ class IntelligentCalibrationSystem:
             tilt, friction, bounce = params
             
             total_error = 0
+            count = 0
             for obs in observations[-50:]:  # Use recent 50
-                if all(k in obs for k in ['predicted', 'actual', 'impact_velocity']):
+                if 'offset' in obs:
                     # Simple error metric
-                    error = abs(obs['predicted'] - obs['actual'])
-                    total_error += error
+                    total_error += abs(obs['offset'])
+                    count += 1
             
-            return total_error
+            return total_error / max(count, 1)
         
         # Bounds for parameters
         bounds = [
@@ -914,14 +786,17 @@ class IntelligentCalibrationSystem:
             self.current_calibration.bounce_randomness
         ]
         
-        # Optimize
-        result = minimize(objective, x0, method='L-BFGS-B', bounds=bounds)
-        
-        if result.success:
-            self.current_calibration.table_tilt = result.x[0]
-            self.current_calibration.friction_coefficient = result.x[1]
-            self.current_calibration.bounce_randomness = result.x[2]
-            logger.info("Parameter optimization successful")
+        try:
+            # Optimize
+            result = minimize(objective, x0, method='L-BFGS-B', bounds=bounds)
+            
+            if result.success:
+                self.current_calibration.table_tilt = result.x[0]
+                self.current_calibration.friction_coefficient = result.x[1]
+                self.current_calibration.bounce_randomness = result.x[2]
+                logger.info("Parameter optimization successful")
+        except Exception as e:
+            logger.warning(f"Optimization failed: {e}")
 
 # ═══════════════════════════  Main Prediction System  ═══════════════════════════
 
@@ -1011,7 +886,8 @@ class ProfessionalRoulettePredictor:
             'calibration': {
                 'confidence': self.calibration_system.current_calibration.confidence,
                 'samples': self.calibration_system.current_calibration.sample_count
-            }
+            },
+            **analysis  # Include analysis data
         }
         
         return result
@@ -1031,8 +907,8 @@ class ProfessionalRoulettePredictor:
         d_ball = np.diff(ball_angles)
         d_wheel = np.diff(wheel_angles)
         
-        omega_ball = np.mean(d_ball / dt)
-        omega_wheel = np.mean(d_wheel / dt)
+        omega_ball = np.mean(d_ball / dt) if len(dt) > 0 else 0
+        omega_wheel = np.mean(d_wheel / dt) if len(dt) > 0 else 0
         
         # Calculate acceleration
         if len(dt) >= 2:
@@ -1098,6 +974,29 @@ class ProfessionalRoulettePredictor:
         
         self.learning_system.add_observation(features, winning_number, predicted)
         
+        # Prepare CSV record
+        csv_record = {
+            'timestamp': datetime.now().isoformat(),
+            'round_id': round_id,
+            'predicted_number': predicted,
+            'actual_number': winning_number,
+            'offset': offset,
+            'confidence': prediction_data.get('confidence', 0),
+            'omega_ball': features['omega_ball'],
+            'alpha_ball': features['alpha_ball'],
+            'omega_wheel': features['omega_wheel'],
+            'impact_velocity': features['impact_velocity'],
+            'rim_time': features['rim_time'],
+            'track_time': features['track_time'],
+            'ml_correction': prediction_data.get('ml_correction', 0),
+            'calibration_confidence': self.calibration_system.current_calibration.confidence,
+            'within_3': abs(offset) <= 3,
+            'within_5': abs(offset) <= 5
+        }
+        
+        # Save to CSV
+        append_csv_record(csv_record)
+        
         # Update calibration if needed
         self.calibration_system.calibration_history.append({
             'predicted': predicted,
@@ -1119,44 +1018,16 @@ class ProfessionalRoulettePredictor:
                     self.calibration_system.current_calibration
                 )
         
-        # Store in dataset
-        self.dataset.append({
-            'round_id': round_id,
-            'predicted': predicted,
-            'actual': winning_number,
-            'offset': offset,
-            'timestamp': time.time(),
-            **features
-        })
-        
-        # Write to CSV
-        csv_record = {
-            'timestamp': time.time(),
-            'round_id': round_id,
-            'predicted_number': predicted,
-            'actual_number': winning_number,
-            'offset': offset,
-            'confidence': prediction_data.get('confidence', 0),
-            'omega_ball': features['omega_ball'],
-            'alpha_ball': features['alpha_ball'],
-            'omega_wheel': features['omega_wheel'],
-            'impact_velocity': features['impact_velocity'],
-            'impact_angle': features['impact_angle'],
-            'rim_time': features['rim_time'],
-            'track_time': features['track_time'],
-            'ml_correction': prediction_data.get('ml_correction', 0),
-            'calibration_confidence': self.calibration_system.current_calibration.confidence,
-            'result': 'HIT' if abs(offset) <= 3 else 'MISS'
-        }
-        storage_manager.append_csv_record(csv_record)
+        # Store in memory dataset
+        self.dataset.append(csv_record)
         
         # Maintain dataset size
         if len(self.dataset) > 1000:
             self.dataset = self.dataset[-1000:]
             
-        # Maintain file size
+        # Maintain CSV file size
         if len(self.dataset) % 100 == 0:
-            storage_manager.maintain_dataset_size()
+            maintain_dataset_size()
     
     def _calculate_offset(self, predicted: int, actual: int) -> int:
         """Calculate signed offset"""
@@ -1181,30 +1052,30 @@ class ProfessionalRoulettePredictor:
         total = len(self.dataset)
         
         # Calculate accuracies
-        direct_hits = sum(1 for d in self.dataset if d['offset'] == 0)
-        within_1 = sum(1 for d in self.dataset if abs(d['offset']) <= 1)
-        within_3 = sum(1 for d in self.dataset if abs(d['offset']) <= 3)
-        within_5 = sum(1 for d in self.dataset if abs(d['offset']) <= 5)
+        direct_hits = sum(1 for d in self.dataset if d.get('offset', 999) == 0)
+        within_1 = sum(1 for d in self.dataset if abs(d.get('offset', 999)) <= 1)
+        within_3 = sum(1 for d in self.dataset if abs(d.get('offset', 999)) <= 3)
+        within_5 = sum(1 for d in self.dataset if abs(d.get('offset', 999)) <= 5)
         
         # Recent performance (last 50)
         recent = self.dataset[-50:] if len(self.dataset) >= 50 else self.dataset
-        recent_hits = sum(1 for d in recent if abs(d['offset']) <= 3)
+        recent_hits = sum(1 for d in recent if abs(d.get('offset', 999)) <= 3)
         
         # Calculate expected return
-        hit_rate = within_3 / total
+        hit_rate = within_3 / total if total > 0 else 0
         expected_return = (hit_rate * 35) - 1
         
         return {
             'total_predictions': total,
             'accuracy': {
-                'direct': round(direct_hits / total * 100, 1),
-                'within_1': round(within_1 / total * 100, 1),
-                'within_3': round(within_3 / total * 100, 1),
-                'within_5': round(within_5 / total * 100, 1)
+                'direct': round(direct_hits / total * 100, 1) if total > 0 else 0,
+                'within_1': round(within_1 / total * 100, 1) if total > 0 else 0,
+                'within_3': round(within_3 / total * 100, 1) if total > 0 else 0,
+                'within_5': round(within_5 / total * 100, 1) if total > 0 else 0
             },
-            'recent_performance': round(recent_hits / len(recent) * 100, 1),
+            'recent_performance': round(recent_hits / len(recent) * 100, 1) if recent else 0,
             'expected_return': f"{expected_return:.1%}",
-            'average_error': round(np.mean([abs(d['offset']) for d in self.dataset]), 2),
+            'average_error': round(np.mean([abs(d.get('offset', 0)) for d in self.dataset]), 2) if self.dataset else 0,
             'calibration': {
                 'status': 'CALIBRATED' if self.calibration_system.current_calibration.confidence > 0.5 else 'CALIBRATING',
                 'confidence': round(self.calibration_system.current_calibration.confidence * 100, 1),
@@ -1237,68 +1108,49 @@ app.add_middleware(
 predictor = ProfessionalRoulettePredictor()
 pending_predictions = {}
 
-def load_dataset():
-    """Load dataset from file"""
-    data = storage_manager.load_model_data()
-    if data:
-        predictor.dataset = data.get('dataset', [])
-        predictor.learning_system.training_data = data.get('training', [])
-        
-        # Load calibration
-        if 'calibration' in data and data['calibration']:
-            calib_data = data['calibration']
-            predictor.calibration_system.current_calibration = CalibrationData(**calib_data)
-        
-        # Recalibrate from loaded data
-        if len(predictor.dataset) >= 20:
-            predictor.calibration_system.auto_calibrate(predictor.dataset)
-        
-        logger.info(f"Loaded {len(predictor.dataset)} records from file")
-
-def save_dataset():
-    """Save dataset to file"""
-    data = {
-        'version': '4.0',
-        'timestamp': time.time(),
-        'dataset': predictor.dataset[-1000:],  # Keep last 1000
-        'training': predictor.learning_system.training_data[-500:],  # Keep last 500
-        'calibration': predictor.calibration_system.current_calibration.dict(),
-        'statistics': predictor.get_statistics()
-    }
-    
-    storage_manager.save_model_data(data)
-    logger.info(f"Saved {len(predictor.dataset)} records to file")
+def initialize_csv():
+    """
+    Initialize CSV file system
+    Already handled by get_data_path() at module load
+    """
+    pass  # All initialization is done at module load
 
 @app.on_event("startup")
 async def startup():
     """Initialize server"""
-    load_dataset()
+    # Load existing CSV data
+    csv_data = load_csv_data()
     
-    # Get storage statistics
-    storage_stats = storage_manager.get_statistics()
+    # Convert CSV data to internal format
+    for record in csv_data:
+        predictor.dataset.append(record)
+    
+    # Recalibrate if we have enough data
+    if len(predictor.dataset) >= 20:
+        predictor.calibration_system.auto_calibrate(predictor.dataset[-100:])
     
     stats = predictor.get_statistics()
     logger.info("=" * 60)
     logger.info("Professional Roulette Prediction Server Started")
-    logger.info(f"Data Path: {storage_stats['data_path']}")
-    logger.info(f"CSV File: {storage_stats['csv_file']}")
+    logger.info(f"Data Path: {os.path.dirname(DATA_PATH)}")
+    logger.info(f"CSV File: {DATA_PATH}")
     logger.info(f"Dataset: {stats['total_predictions']} predictions")
-    logger.info(f"Calibration: {stats['calibration']['status']}")
-    logger.info(f"ML Model: {'TRAINED' if stats['ml_model']['trained'] else 'LEARNING'}")
+    
+    # Only log calibration if we have the key
+    if 'calibration' in stats:
+        logger.info(f"Calibration: {stats['calibration'].get('status', 'UNKNOWN')}")
+    
     logger.info("=" * 60)
 
 @app.on_event("shutdown")
 async def shutdown():
     """Save data on shutdown"""
-    save_dataset()
-    storage_manager.create_backup("shutdown")
-    logger.info("Server shutdown - data saved and backed up")
+    logger.info("Server shutdown")
 
 @app.get("/")
 async def root():
     """Server status and statistics"""
     stats = predictor.get_statistics()
-    storage_stats = storage_manager.get_statistics()
     
     return {
         "server": "Professional Roulette Prediction Server v4.0",
@@ -1306,15 +1158,16 @@ async def root():
         "physics_model": "Small & Tse (2012) Enhanced",
         "machine_learning": "RandomForest with AutoML",
         "statistics": stats,
-        "storage": storage_stats,
+        "data_storage": {
+            "path": DATA_PATH,
+            "records": len(predictor.dataset)
+        },
         "capabilities": {
             "auto_calibration": True,
             "adaptive_learning": True,
             "physics_simulation": "Full Navier-Stokes",
             "deflector_modeling": "Energy-based with scatter",
-            "confidence_estimation": True,
-            "data_persistence": True,
-            "automatic_backup": True
+            "confidence_estimation": True
         }
     }
 
@@ -1370,14 +1223,6 @@ async def log_winner(request: LogWinnerRequest):
             prediction_data
         )
         
-        # Save dataset periodically
-        if len(predictor.dataset) % 10 == 0:
-            save_dataset()
-        
-        # Create backup periodically
-        if len(predictor.dataset) % 100 == 0:
-            storage_manager.create_backup("periodic")
-        
         # Calculate result
         offset = predictor._calculate_offset(
             prediction_data['predicted_number'],
@@ -1423,11 +1268,6 @@ async def get_calibration():
         }
     }
 
-@app.get("/storage")
-async def get_storage_info():
-    """Get storage system information"""
-    return storage_manager.get_statistics()
-
 if __name__ == "__main__":
     import uvicorn
     
@@ -1440,7 +1280,9 @@ if __name__ == "__main__":
     print("  • Progressive machine learning")
     print("  • Deflector collision modeling")
     print("  • Statistical confidence estimation")
-    print("  • Advanced data persistence system")
+    print("  • Persistent CSV data storage")
+    print("="*70)
+    print(f"Data storage: {DATA_PATH}")
     print("="*70 + "\n")
     
     uvicorn.run(app, host="0.0.0.0", port=5000)
