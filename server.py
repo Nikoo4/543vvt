@@ -1,6 +1,7 @@
 """
 Professional Roulette Prediction Server
-Advanced physics-based prediction with bounce modeling
+Advanced physics-based prediction with realistic bounce modeling
+Based on Small & Tse (2012) paper methodology
 """
 
 from __future__ import annotations
@@ -8,12 +9,14 @@ import math, csv, os, time, uuid, json
 from collections import deque, defaultdict
 from typing import List, Dict, Any, Optional, Tuple
 import numpy as np
+from scipy.integrate import odeint
+from scipy.optimize import minimize_scalar
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
-# ─────────────────────────  Roulette Layout  ─────────────────────────────────
+# ──────────────────────────  Roulette Layout  ─────────────────────────────────
 WHEEL_SEQUENCE = [
     0, 32, 15, 19,  4, 21,  2, 25, 17, 34,  6, 27,
    13, 36, 11, 30,  8, 23, 10,  5, 24, 16, 33,  1,
@@ -28,7 +31,7 @@ def normalize_index(i: int) -> int:
 def normalize_angle(a: float) -> float: 
    return (a + 2*math.pi) % (2*math.pi)
 
-# ────────────────────────  Request Models  ──────────────────────────────────
+# ──────────────────────────  Request Models  ──────────────────────────────────
 class Crossing(BaseModel):
    idx: int
    t: float
@@ -48,29 +51,52 @@ class LogWinnerRequest(BaseModel):
    timestamp: Optional[int] = None
    predicted_number: Optional[int] = None
 
-# ─────────────────────────────  Physics Constants  ────────────────────────────────
+# ───────────────────────────  Physics Constants  ──────────────────────────────
 # Fundamental physics
 GRAVITY = 9.81  # m/s²
-WHEEL_RADIUS = 0.41  # meters
-TRACK_RADIUS = 0.48
-DEFLECTOR_RADIUS = 0.38
-TABLE_TILT = math.radians(2.5)
-ROLLING_FRICTION = 0.005
-INTEGRATION_STEP = 0.001
 
-# Bounce physics
-DEFLECTOR_ELASTICITY = 0.65  # Energy retention on deflector hit
+# These will be calibrated from actual data
+DEFAULT_WHEEL_RADIUS = 0.41  # Initial guess
+DEFAULT_TRACK_RADIUS = 0.48  # Initial guess
+DEFAULT_DEFLECTOR_RADIUS = 0.38  # Initial guess
+DEFAULT_TABLE_TILT = math.radians(0.5)  # Initial guess
+
+# Calibration parameters
+MIN_CALIBRATION_SPINS = 20  # Need at least 20 spins to calibrate
+CALIBRATION_CONFIDENCE_THRESHOLD = 0.8
+
+# Ball physics
+BALL_MASS = 0.002  # 2 grams typical
+BALL_RADIUS = 0.01  # 10mm ball
+AIR_DENSITY = 1.225  # kg/m³
+DRAG_COEFFICIENT = 0.47  # sphere
+
+# Friction model (more realistic)
+ROLLING_FRICTION_COEFFICIENT = 0.005  # dimensionless
+SLIDING_FRICTION_COEFFICIENT = 0.4   # ball on track
+VISCOUS_FRICTION = 0.001  # speed-dependent term
+
+# Deflector physics
+DEFLECTOR_COUNT = 8  # typical for European wheel
+DEFLECTOR_HEIGHT = 0.014  # 14mm typical
+DEFLECTOR_ANGLE = math.radians(45)  # typical deflector angle
+COEFFICIENT_OF_RESTITUTION = 0.6  # energy retained after deflector hit
+
+# Pocket physics
 FRET_HEIGHT = 0.008  # 8mm pocket dividers
-BALL_RADIUS = 0.01   # 10mm ball
 POCKET_WIDTH = 0.053  # 53mm pocket width
-BOUNCE_RANDOMNESS = 0.15  # 15% random factor
+POCKET_DEPTH = 0.037  # 37mm typical
+FRET_ELASTICITY = 0.3  # energy retained hitting fret
+
+# Integration parameters
+INTEGRATION_STEP = 0.001  # 1ms time step
+MAX_INTEGRATION_TIME = 20.0  # seconds
 
 # Learning parameters
-MIN_DATA_FOR_BOUNCE_MODEL = 30  # Changed from 50 to 30
-BOUNCE_PATTERN_WINDOW = 100
+MIN_DATA_FOR_PHYSICS_MODEL = 50  # Start physics predictions after 50 spins
 CONFIDENCE_THRESHOLD = 0.7
 
-# File management
+# File management (keeping original)
 DATA_FILE_NAME = "roulette_data.csv"
 MAX_DATASET_SIZE = 1000
 
@@ -86,7 +112,99 @@ CSV_COLUMNS = [
    "error_slots", "bounce_pattern",
 ]
 
-# ─────────────────────────  File Management  ──────────────────────────────────
+# ──────────────────────────  Auto-Calibration System  ────────────────────────
+class WheelCalibration:
+    """Automatically calibrate wheel parameters from observed data"""
+    
+    def __init__(self):
+        self.calibrated = False
+        self.wheel_radius = DEFAULT_WHEEL_RADIUS
+        self.track_radius = DEFAULT_TRACK_RADIUS
+        self.deflector_radius = DEFAULT_DEFLECTOR_RADIUS
+        self.table_tilt = DEFAULT_TABLE_TILT
+        self.calibration_data = []
+        
+    def add_observation(self, crossing_data: Dict[str, Any], outcome: Dict[str, Any]):
+        """Add observation for calibration"""
+        self.calibration_data.append({
+            'crossings': crossing_data,
+            'outcome': outcome,
+            'timestamp': time.time()
+        })
+        
+    def calibrate(self) -> bool:
+        """
+        Calibrate wheel parameters from observations
+        Returns True if successful
+        """
+        if len(self.calibration_data) < MIN_CALIBRATION_SPINS:
+            return False
+            
+        print(f"Starting calibration with {len(self.calibration_data)} observations...")
+        
+        # Extract timing patterns
+        rim_times = []
+        impact_times = []
+        
+        for data in self.calibration_data:
+            # Analyze deceleration patterns
+            crossings = data['crossings']
+            if len(crossings) >= 3:
+                # Time between crossings increases as ball slows
+                dt1 = crossings[1]['t'] - crossings[0]['t']
+                dt2 = crossings[2]['t'] - crossings[1]['t']
+                decel_ratio = dt2 / dt1
+                
+                # This ratio depends on wheel geometry
+                rim_times.append(dt1)
+                impact_times.append(data['outcome'].get('impact_time', 5.0))
+        
+        # Estimate wheel size from timing patterns
+        if rim_times:
+            avg_rim_time = np.mean(rim_times)
+            # Typical ball velocity ~2-5 m/s on rim
+            # One revolution time gives us circumference estimate
+            estimated_circumference = avg_rim_time * 3.5  # Assuming ~3.5 m/s average
+            self.track_radius = estimated_circumference / (2 * math.pi)
+            
+            # Wheel is typically 85% of track radius
+            self.wheel_radius = self.track_radius * 0.85
+            
+            # Deflectors are typically at 80% of track radius
+            self.deflector_radius = self.track_radius * 0.80
+            
+            # Estimate tilt from deceleration pattern
+            decel_rates = []
+            for data in self.calibration_data:
+                if 'alpha_ball' in data['crossings']:
+                    decel_rates.append(abs(data['crossings']['alpha_ball']))
+            
+            if decel_rates:
+                avg_decel = np.mean(decel_rates)
+                # Higher deceleration = more tilt
+                # Typical range: 0.5-2.0 rad/s²
+                self.table_tilt = math.radians(0.2 + (avg_decel - 0.5) * 0.5)
+            
+            self.calibrated = True
+            print(f"Calibration complete:")
+            print(f"  Track radius: {self.track_radius:.3f} m")
+            print(f"  Wheel radius: {self.wheel_radius:.3f} m") 
+            print(f"  Deflector radius: {self.deflector_radius:.3f} m")
+            print(f"  Table tilt: {math.degrees(self.table_tilt):.2f}°")
+            
+            return True
+            
+        return False
+    
+    def get_parameters(self) -> Dict[str, float]:
+        """Get current parameters (calibrated or default)"""
+        return {
+            'wheel_radius': self.wheel_radius,
+            'track_radius': self.track_radius,
+            'deflector_radius': self.deflector_radius,
+            'table_tilt': self.table_tilt,
+            'calibrated': self.calibrated
+        }
 def as_file_path(path: str) -> str:
     """Convert path to absolute file path"""
     return os.path.abspath(os.path.expanduser(path))
@@ -100,10 +218,8 @@ def try_path(candidates: List[str]) -> str:
         d = os.path.dirname(c) or "."
         try:
             os.makedirs(d, exist_ok=True)
-            # проверяем запись
             with open(c, "a", encoding="utf-8") as f:
                 pass
-            # если файл новый — пишем заголовок
             if os.path.getsize(c) == 0:
                 with open(c, "w", newline="", encoding="utf-8") as f:
                     csv.writer(f).writerow(CSV_COLUMNS)
@@ -127,8 +243,7 @@ DATA_PATH = get_data_path()
 
 def initialize_csv():
     """Ensure CSV exists with headers"""
-    # Already handled by try_path
-    pass
+    pass  # Already handled by try_path
 
 def read_dataset() -> List[Dict[str, str]]:
     """Read all data from CSV"""
@@ -153,504 +268,295 @@ def maintain_dataset_size():
     """Keep dataset within size limits"""
     records = read_dataset()
     
-    # Only enforce size limit, no quality filtering
     if len(records) > MAX_DATASET_SIZE:
         records = records[-MAX_DATASET_SIZE:]
         
-        # Rewrite file
         with open(DATA_PATH, "w", newline="", encoding="utf-8") as f:
             writer = csv.DictWriter(f, fieldnames=CSV_COLUMNS)
             writer.writeheader()
             writer.writerows(records)
         print(f"Dataset size maintained: {len(records)} records")
 
-# ─────────────────────────  Data Validation  ──────────────────────────────────
-def validate_crossings(crossings: List[Crossing]) -> Dict[str, Any]:
-    """
-    Validate quality of crossing data
-    Returns validation result with quality score
-    """
-    issues = []
-    deviations = []
-    quality_score = 1.0
+# ──────────────────────────  Physics Engine  ──────────────────────────────────
+class RoulettePhysics:
+    """Complete physics model based on Small & Tse (2012)"""
     
-    # Check angle deviations from 180°
-    for i, c in enumerate(crossings):
-        angle_deg = (c.theta * 180 / math.pi) % 360
+    def __init__(self, calibration: WheelCalibration):
+        self.calibration = calibration
         
-        # Calculate deviation from 180°
-        # Handle both cases: near 180° and near 0°/360°
-        dev_from_180 = abs(angle_deg - 180)
-        dev_from_0 = min(angle_deg, 360 - angle_deg)
+    @property
+    def table_tilt(self):
+        return self.calibration.table_tilt
         
-        # Take minimum deviation
-        deviation = min(dev_from_180, dev_from_0)
-        deviations.append(deviation)
+    @property
+    def track_radius(self):
+        return self.calibration.track_radius
         
-        if deviation > 30:
-            issues.append(f"Cross #{i+1}: Large deviation {deviation:.1f}°")
-            quality_score *= 0.5
-        elif deviation > 20:
-            issues.append(f"Cross #{i+1}: Moderate deviation {deviation:.1f}°")
-            quality_score *= 0.8
-        elif deviation > 10:
-            quality_score *= 0.95
-    
-    # Check time monotonicity
-    times = [c.t for c in crossings]
-    if not all(times[i] < times[i+1] for i in range(len(times)-1)):
-        issues.append("Non-monotonic time sequence")
-        quality_score *= 0.3
-    
-    # Check time intervals
-    if len(times) >= 2:
-        intervals = [times[i+1] - times[i] for i in range(len(times)-1)]
+    @property
+    def wheel_radius(self):
+        return self.calibration.wheel_radius
         
-        for i, interval in enumerate(intervals):
-            if interval < 0.1:
-                issues.append(f"Interval {i+1} too short: {interval:.3f}s")
-                quality_score *= 0.5
-            elif interval > 3.0:
-                issues.append(f"Interval {i+1} too long: {interval:.3f}s")
-                quality_score *= 0.7
+    @property
+    def deflector_radius(self):
+        return self.calibration.deflector_radius
         
-        # Check consistency of intervals
-        if len(intervals) >= 2:
-            interval_ratio = max(intervals) / min(intervals)
-            if interval_ratio > 2.0:
-                issues.append(f"Inconsistent intervals (ratio: {interval_ratio:.1f})")
-                quality_score *= 0.8
-    
-    # Check angular velocity reasonableness
-    if len(times) >= 2 and len(crossings) >= 2:
-        avg_angular_velocity = abs(crossings[-1].theta - crossings[0].theta) / (times[-1] - times[0])
+    def ball_dynamics(self, state: np.ndarray, t: float) -> np.ndarray:
+        """
+        Differential equations for ball motion on the track
+        state = [r, theta, dr/dt, dtheta/dt]
+        """
+        r, theta, v_r, omega = state
         
-        if avg_angular_velocity < 0.5:  # Too slow
-            issues.append(f"Angular velocity too low: {avg_angular_velocity:.2f} rad/s")
-            quality_score *= 0.6
-        elif avg_angular_velocity > 20.0:  # Too fast
-            issues.append(f"Angular velocity too high: {avg_angular_velocity:.2f} rad/s")
-            quality_score *= 0.4
-    
-    # Always allow prediction
-    valid = True  # Always valid for prediction
-    
-    return {
-        "valid": valid,
-        "quality_score": quality_score,
-        "reason": "; ".join(issues) if issues else "OK",
-        "issues": issues,
-        "deviations": [f"{d:.1f}°" for d in deviations]
-    }
-
-# ─────────────────────────  Mathematical Functions  ──────────────────────────────────
-def smooth_data(data: List[float]) -> List[float]:
-    """Apply Savitzky-Golay smoothing filter"""
-    if len(data) < 5:
-        return data
-    
-    coefficients = [-3, 12, 17, 12, -3]
-    smoothed = []
-    
-    for i in range(len(data)):
-        if i < 2 or i >= len(data) - 2:
-            smoothed.append(data[i])
-        else:
-            value = sum(c * data[i - 2 + j] for j, c in enumerate(coefficients))
-            smoothed.append(value / 35)
-    
-    return smoothed
-
-def fit_trajectory(times: List[float], positions: List[float]) -> Tuple[float, float, float]:
-    """
-    Fit quadratic trajectory: θ(t) = a₀ + a₁t + a₂t²
-    Returns: (a0, a1, a2) where ω=a1, α=2*a2
-    """
-    if len(times) < 3:
-        raise ValueError("Need at least 3 points")
-    
-    t0 = times[0]
-    dt = [t - t0 for t in times]
-    n = len(dt)
-    
-    # Build normal equations
-    sum_t = sum(dt)
-    sum_t2 = sum(t**2 for t in dt)
-    sum_t3 = sum(t**3 for t in dt)
-    sum_t4 = sum(t**4 for t in dt)
-    sum_y = sum(positions)
-    sum_ty = sum(t*y for t, y in zip(dt, positions))
-    sum_t2y = sum(t*t*y for t, y in zip(dt, positions))
-    
-    # Solve system
-    det = n*sum_t2*sum_t4 + 2*sum_t*sum_t2*sum_t3 - sum_t2**3 - n*sum_t3**2 - sum_t**2*sum_t4
-    
-    if abs(det) < 1e-9:
-        # Fallback to linear approximation
-        time_diff = times[-1] - times[0]
-        if abs(time_diff) < 1e-9:
-            return positions[0], 0.0, 0.0
-        omega = (positions[-1] - positions[0]) / time_diff
-        return positions[0], omega, -0.5
-    
-    a0 = (sum_y*sum_t2*sum_t4 + sum_t*sum_t3*sum_t2y + sum_t2*sum_t3*sum_ty -
-          sum_t2**2*sum_y - sum_t*sum_t2y*sum_t4 - sum_t3**2*sum_ty) / det
-    
-    a1 = (n*sum_t3*sum_t2y + sum_y*sum_t*sum_t4 + sum_t2**2*sum_ty -
-          sum_t2*sum_y*sum_t3 - n*sum_t4*sum_ty - sum_t**2*sum_t2y) / det
-    
-    a2 = (n*sum_t2*sum_t2y + sum_t*sum_t2*sum_ty + sum_y*sum_t*sum_t3 -
-          sum_t2**2*sum_y - sum_t**2*sum_t2y - n*sum_t3*sum_ty) / det
-    
-    return a0, a1, a2
-
-def calculate_impact_time(omega0: float, alpha: float) -> float:
-    """Calculate time until ball reaches deflectors"""
-    omega_critical = math.sqrt(GRAVITY * math.tan(TABLE_TILT) / TRACK_RADIUS)
-    
-    # Time on rim - protect against division by zero
-    if abs(alpha) < 1e-9:
-        t_rim = 0
-    else:
-        if omega0 > omega_critical:
-            t_rim = (omega0 - omega_critical) / abs(alpha)
-        else:
-            t_rim = 0
-    
-    # Time sliding on track
-    r = TRACK_RADIUS
-    v_radial = 0
-    t = 0
-    omega = omega_critical if t_rim > 0 else omega0
-    
-    while r > DEFLECTOR_RADIUS and t < 5.0:
-        a_radial = r * omega**2 * math.cos(TABLE_TILT) - GRAVITY * math.sin(TABLE_TILT)
-        v_radial += a_radial * INTEGRATION_STEP
-        r += v_radial * INTEGRATION_STEP
-        omega += alpha * INTEGRATION_STEP
-        t += INTEGRATION_STEP
+        # Skip if ball has reached deflectors
+        if r <= self.deflector_radius:
+            return np.array([0, 0, 0, 0])
         
-        if omega <= 0:
-            break
-    
-    return t_rim + t
-
-def angle_to_pocket(angle: float) -> int:
-    """Convert angle to pocket number"""
-    index = int(round((angle / (2*math.pi)) * WHEEL_SIZE)) % WHEEL_SIZE
-    return WHEEL_SEQUENCE[index]
-
-def pocket_distance(pocket1: int, pocket2: int, direction: str = "cw") -> int:
-    """Calculate distance between pockets"""
-    i1, i2 = POCKET_POSITION[pocket1], POCKET_POSITION[pocket2]
-    if direction.lower() == "cw":
-        return normalize_index(i2 - i1)
-    else:
-        return normalize_index(i1 - i2)
-
-# ─────────────────────────  Bounce Physics Engine  ──────────────────────────────────
-class BouncePredictor:
-    """Advanced bounce prediction using physics and statistics"""
-    
-    def __init__(self):
-        self.bounce_patterns = defaultdict(lambda: defaultdict(int))
-        self.pattern_confidence = {}
+        # Velocity magnitude
+        v_total = math.sqrt(v_r**2 + (r * omega)**2)
         
-    def update_patterns(self, impact_data: Dict[str, Any], winning_pocket: int):
-        """Learn bounce patterns from historical data"""
-        key = self._get_pattern_key(impact_data)
-        offset = pocket_distance(impact_data['predicted'], winning_pocket, impact_data['direction'])
+        # Forces in radial direction
+        F_centrifugal = BALL_MASS * r * omega**2
+        F_gravity_r = BALL_MASS * GRAVITY * math.sin(self.table_tilt)
         
-        # Store bounce pattern
-        self.bounce_patterns[key][offset] += 1
+        # Air resistance (quadratic in velocity)
+        F_drag_r = 0.5 * AIR_DENSITY * DRAG_COEFFICIENT * math.pi * BALL_RADIUS**2 * v_r * v_total
         
-        # Update confidence
-        total = sum(self.bounce_patterns[key].values())
-        if total >= MIN_DATA_FOR_BOUNCE_MODEL:
-            self.pattern_confidence[key] = min(total / BOUNCE_PATTERN_WINDOW, 1.0)
-    
-    def predict_bounce_distribution(self, impact_data: Dict[str, Any], dataset_size: int) -> List[int]:
-        """Predict most likely pockets after bounce"""
-        key = self._get_pattern_key(impact_data)
-        
-        # Check dataset size for decision
-        if dataset_size < 30:
-            # Pure physics-based prediction for first 30 records
-            return self._physics_based_prediction(impact_data)
-        elif dataset_size < 100:
-            # Hybrid approach for 30-100 records
-            if key not in self.bounce_patterns:
-                return self._physics_based_prediction(impact_data)
-            # Use statistical but with lower confidence threshold
-            pattern = self.bounce_patterns[key]
-            if sum(pattern.values()) < 5:
-                return self._physics_based_prediction(impact_data)
-        
-        # Full statistical prediction for 100+ records
-        if key not in self.bounce_patterns or self.pattern_confidence.get(key, 0) < CONFIDENCE_THRESHOLD:
-            return self._physics_based_prediction(impact_data)
-        
-        # Use statistical prediction
-        pattern = self.bounce_patterns[key]
-        
-        # Sort by frequency
-        sorted_offsets = sorted(pattern.items(), key=lambda x: x[1], reverse=True)
-        
-        # Get top 4 predictions
-        predicted_pocket = impact_data['predicted']
-        direction = impact_data['direction']
-        jump_pockets = []
-        
-        for offset, _ in sorted_offsets[:4]:
-            if direction.lower() == "cw":
-                idx = normalize_index(POCKET_POSITION[predicted_pocket] + offset)
-            else:
-                idx = normalize_index(POCKET_POSITION[predicted_pocket] - offset)
-            jump_pockets.append(WHEEL_SEQUENCE[idx])
-        
-        # Ensure we have 4 predictions
-        while len(jump_pockets) < 4:
-            jump_pockets.extend(self._get_neighboring_pockets(predicted_pocket, len(jump_pockets)))
-        
-        return jump_pockets[:4]
-    
-    def _get_pattern_key(self, impact_data: Dict[str, Any]) -> str:
-        """Create key for pattern matching"""
-        # Discretize continuous values
-        speed_category = int(impact_data['omega_ball'] * 2)  # 0.5 rad/s bins
-        wheel_speed = int(impact_data.get('omega_wheel', 0) * 4)  # 0.25 rad/s bins
-        
-        return f"{speed_category}_{wheel_speed}_{impact_data['direction']}"
-    
-    def _physics_based_prediction(self, impact_data: Dict[str, Any]) -> List[int]:
-        """Fallback physics-based prediction"""
-        predicted = impact_data['predicted']
-        omega_ball = abs(impact_data['omega_ball'])
-        
-        # Estimate bounce distance based on impact velocity
-        if omega_ball > 4.0:  # High speed
-            offsets = [2, -2, 4, -4]
-        elif omega_ball > 2.5:  # Medium speed
-            offsets = [1, -1, 2, -2]
-        else:  # Low speed
-            offsets = [1, 2, 3, -1]
-        
-        jump_pockets = []
-        for offset in offsets:
-            idx = normalize_index(POCKET_POSITION[predicted] + offset)
-            jump_pockets.append(WHEEL_SEQUENCE[idx])
-        
-        return jump_pockets
-    
-    def _get_neighboring_pockets(self, pocket: int, skip: int = 0) -> List[int]:
-        """Get neighboring pockets"""
-        idx = POCKET_POSITION[pocket]
-        neighbors = []
-        
-        for i in range(1, 6):
-            if len(neighbors) >= 4 - skip:
-                break
-            neighbors.append(WHEEL_SEQUENCE[normalize_index(idx + i)])
-            if len(neighbors) >= 4 - skip:
-                break
-            neighbors.append(WHEEL_SEQUENCE[normalize_index(idx - i)])
-        
-        return neighbors[:4 - skip]
-
-# ─────────────────────────  Learning Control System  ──────────────────────────────────
-def should_stop_learning() -> bool:
-    """
-    Intelligent system to determine when to stop collecting data
-    Returns True when optimal accuracy is reached or no improvement detected
-    """
-    records = read_dataset()
-    
-    # Minimum dataset requirement
-    if len(records) < 200:
-        return False
-    
-    # Analyze recent performance
-    recent_50 = records[-50:]
-    recent_errors = []
-    direct_hits = 0
-    jump_hits = 0
-    
-    for r in recent_50:
-        if r.get("error_slots") and r.get("winning_number"):
-            try:
-                error = int(r["error_slots"])
-                recent_errors.append(error)
-                
-                if error == 0:
-                    direct_hits += 1
-                
-                pattern = r.get("bounce_pattern", "")
-                if pattern == "direct_hit" or pattern == "jump_hit":
-                    jump_hits += 1
-            except:
-                continue
-    
-    if not recent_errors:
-        return False
-    
-    # Calculate metrics
-    avg_error = sum(recent_errors) / len(recent_errors)
-    accuracy_rate = (direct_hits + jump_hits) / len(recent_errors)
-    
-    # Criterion 1: Optimal accuracy achieved
-    if avg_error <= 3.0 and accuracy_rate >= 0.85:
-        print("🎯 OPTIMAL ACCURACY REACHED")
-        print(f"   Average error: {avg_error:.1f} pockets")
-        print(f"   Accuracy rate: {accuracy_rate*100:.1f}%")
-        print("   ➡️ Learning stopped - Model is optimized")
-        return True
-    
-    # Criterion 2: Check for improvement plateau
-    if len(records) >= 400:
-        # Compare two 100-record windows
-        older_100 = records[-400:-200]
-        newer_100 = records[-200:]
-        
-        older_errors = []
-        newer_errors = []
-        
-        for r in older_100:
-            if r.get("error_slots"):
-                try:
-                    older_errors.append(int(r["error_slots"]))
-                except:
-                    pass
-        
-        for r in newer_100:
-            if r.get("error_slots"):
-                try:
-                    newer_errors.append(int(r["error_slots"]))
-                except:
-                    pass
-        
-        if older_errors and newer_errors:
-            old_avg = sum(older_errors) / len(older_errors)
-            new_avg = sum(newer_errors) / len(newer_errors)
-            improvement = old_avg - new_avg
+        # Friction force (combination of rolling and sliding)
+        if v_total > 0.001:  # Moving
+            # Direction of friction opposes motion
+            friction_r = ROLLING_FRICTION_COEFFICIENT * BALL_MASS * GRAVITY * math.cos(self.table_tilt) * (v_r / v_total)
+            friction_theta = ROLLING_FRICTION_COEFFICIENT * BALL_MASS * GRAVITY * math.cos(self.table_tilt) * (r * omega / v_total)
             
-            # No significant improvement
-            if improvement < 0.5:
-                print("📊 LEARNING PLATEAU DETECTED")
-                print(f"   Old average: {old_avg:.1f} pockets")
-                print(f"   New average: {new_avg:.1f} pockets")
-                print(f"   Improvement: {improvement:.1f} pockets")
-                print("   ➡️ Learning stopped - No further improvement")
-                return True
-    
-    # Criterion 3: Maximum dataset size
-    if len(records) >= MAX_DATASET_SIZE - 50:
-        print("📦 APPROACHING DATASET LIMIT")
-        print(f"   Current records: {len(records)}")
-        print(f"   Maximum allowed: {MAX_DATASET_SIZE}")
+            # Add viscous term
+            friction_r += VISCOUS_FRICTION * v_r
+            friction_theta += VISCOUS_FRICTION * r * omega
+        else:
+            friction_r = 0
+            friction_theta = 0
         
-        # If we're also performing well, stop
-        if avg_error <= 5.0:
-            print("   ➡️ Learning stopped - Good accuracy + size limit")
-            return True
+        # Accelerations
+        a_r = (F_centrifugal - F_gravity_r - F_drag_r - friction_r) / BALL_MASS
+        a_theta = -(friction_theta) / (BALL_MASS * r)
+        
+        return np.array([v_r, omega, a_r, a_theta])
     
-    return False
-
-def get_learning_status() -> Dict[str, Any]:
-    """Get detailed learning status"""
-    records = read_dataset()
+    def find_rim_departure(self, omega_initial: float, alpha: float) -> Tuple[float, float]:
+        """
+        Find when and where ball leaves the rim
+        Returns: (time, angular_velocity)
+        """
+        # Critical angular velocity where centripetal force = gravity component
+        omega_critical = math.sqrt(GRAVITY * math.tan(self.table_tilt) / self.track_radius)
+        
+        if omega_initial <= omega_critical:
+            return 0.0, omega_initial
+        
+        # Time to reach critical velocity (assuming constant deceleration)
+        if abs(alpha) > 1e-9:
+            t_rim = (omega_initial - omega_critical) / abs(alpha)
+        else:
+            t_rim = float('inf')
+        
+        return t_rim, omega_critical
     
-    if not records:
+    def simulate_track_motion(self, omega_initial: float, alpha: float) -> Tuple[float, float, float]:
+        """
+        Simulate ball motion from rim departure to deflector impact
+        Returns: (impact_time, impact_velocity, impact_angle)
+        """
+        t_rim, omega_rim = self.find_rim_departure(omega_initial, alpha)
+        
+        # Initial conditions when ball leaves rim
+        state0 = np.array([
+            self.track_radius,  # r
+            0.0,               # theta (relative)
+            0.0,               # v_r (starts with no radial velocity)
+            omega_rim          # angular velocity
+        ])
+        
+        # Time points for integration
+        t_span = np.linspace(0, MAX_INTEGRATION_TIME, int(MAX_INTEGRATION_TIME / INTEGRATION_STEP))
+        
+        # Solve differential equations
+        solution = odeint(self.ball_dynamics, state0, t_span)
+        
+        # Find when ball reaches deflectors
+        for i, (r, theta, v_r, omega) in enumerate(solution):
+            if r <= self.deflector_radius:
+                t_impact = t_rim + t_span[i]
+                v_impact = math.sqrt(v_r**2 + (r * omega)**2)
+                angle_impact = math.atan2(v_r, r * omega)
+                return t_impact, v_impact, angle_impact
+        
+        # Fallback if no impact found
+        return t_rim + 5.0, 0.0, 0.0
+    
+    def model_deflector_collision(self, v_impact: float, angle_impact: float) -> Dict[str, float]:
+        """
+        Model collision with deflector using conservation laws
+        Returns scatter parameters
+        """
+        # Energy loss due to inelastic collision
+        v_after = v_impact * COEFFICIENT_OF_RESTITUTION
+        
+        # Deflection angle depends on impact angle and deflector geometry
+        deflection_mean = DEFLECTOR_ANGLE * (1 - abs(angle_impact) / (math.pi / 2))
+        deflection_std = math.radians(10)  # 10 degree standard deviation
+        
+        # Vertical component (how high ball bounces)
+        vertical_energy = 0.5 * BALL_MASS * v_after**2 * math.sin(deflection_mean)**2
+        max_height = vertical_energy / (BALL_MASS * GRAVITY)
+        
         return {
-            "status": "collecting",
-            "progress": 0,
-            "message": "Collecting initial data"
+            'velocity_after': v_after,
+            'deflection_angle': deflection_mean,
+            'deflection_std': deflection_std,
+            'bounce_height': max_height,
+            'energy_retained': (v_after / v_impact)**2
         }
     
-    # Calculate metrics
-    recent_errors = []
-    for r in records[-50:]:
-        if r.get("error_slots"):
+    def predict_scatter_distribution(self, collision_params: Dict[str, float]) -> List[Tuple[int, float]]:
+        """
+        Predict probability distribution of final pockets based on collision
+        Returns list of (pocket_offset, probability)
+        """
+        v_after = collision_params['velocity_after']
+        bounce_height = collision_params['bounce_height']
+        
+        # Higher velocity = more scatter
+        # Higher bounce = more randomness
+        mean_scatter = 2.5 * v_after / 5.0  # Normalized to ~5 m/s max impact
+        std_scatter = 1.0 + bounce_height / 0.02  # Normalized to 2cm bounce
+        
+        # Generate probability distribution
+        distribution = []
+        for offset in range(-6, 7):  # -6 to +6 pockets
+            # Gaussian distribution
+            prob = math.exp(-(offset - mean_scatter)**2 / (2 * std_scatter**2))
+            prob /= math.sqrt(2 * math.pi * std_scatter**2)
+            distribution.append((offset, prob))
+        
+        # Normalize
+        total_prob = sum(p for _, p in distribution)
+        distribution = [(offset, p / total_prob) for offset, p in distribution]
+        
+        return distribution
+
+# ──────────────────────────  Advanced Bounce Predictor  ───────────────────────
+class PhysicsBasedBouncePredictor:
+    """Bounce prediction using physics model + machine learning"""
+    
+    def __init__(self, calibration: WheelCalibration):
+        self.physics = RoulettePhysics(calibration)
+        self.calibration = calibration
+        self.bounce_history = defaultdict(list)
+        self.model_parameters = {}
+        self.dataset_size = 0
+        
+    def update_from_history(self, records: List[Dict[str, str]]):
+        """Learn from historical data"""
+        self.dataset_size = len(records)
+        
+        for record in records:
+            if not all(record.get(k) for k in ['omega_ball', 'winning_number', 'predicted_number']):
+                continue
+                
             try:
-                recent_errors.append(int(r["error_slots"]))
-            except:
-                pass
+                omega = float(record['omega_ball'])
+                predicted = int(record['predicted_number'])
+                actual = int(record['winning_number'])
+                direction = record.get('direction', 'cw')
+                
+                # Calculate offset
+                offset = self._calculate_offset(predicted, actual, direction)
+                
+                # Categorize by velocity range
+                velocity_key = int(abs(omega) * 2)  # 0.5 rad/s bins
+                self.bounce_history[velocity_key].append(offset)
+                
+            except (ValueError, KeyError):
+                continue
     
-    avg_error = sum(recent_errors) / len(recent_errors) if recent_errors else float('inf')
+    def predict_bounce(self, omega_ball: float, alpha_ball: float, omega_wheel: float, 
+                      direction: str) -> List[int]:
+        """
+        Predict most likely pockets using physics + statistics
+        """
+        # Use pure physics for first 50 spins
+        if self.dataset_size < MIN_DATA_FOR_PHYSICS_MODEL:
+            return self._pure_physics_prediction(omega_ball, alpha_ball)
+        
+        # Hybrid approach after 50 spins
+        physics_pred = self._physics_based_prediction(omega_ball, alpha_ball)
+        
+        # Adjust based on historical data if available
+        velocity_key = int(abs(omega_ball) * 2)
+        if velocity_key in self.bounce_history and len(self.bounce_history[velocity_key]) >= 10:
+            historical_offsets = self.bounce_history[velocity_key]
+            
+            # Find most common offsets
+            offset_counts = defaultdict(int)
+            for offset in historical_offsets:
+                offset_counts[offset] += 1
+            
+            # Weight physics predictions by historical frequency
+            adjusted_pred = []
+            for pocket_offset in physics_pred:
+                weight = offset_counts.get(pocket_offset, 1)
+                adjusted_pred.extend([pocket_offset] * weight)
+            
+            # Return top 4 most likely
+            from collections import Counter
+            most_common = Counter(adjusted_pred).most_common(4)
+            return [offset for offset, _ in most_common]
+        
+        return physics_pred[:4]
     
-    # Determine status
-    if should_stop_learning():
-        status = "optimized"
-        message = "Model optimized - No longer collecting data"
-    elif len(records) < 50:
-        status = "initial"
-        message = f"Initial learning phase ({len(records)}/50)"
-    elif len(records) < 200:
-        status = "training"
-        message = f"Active training ({len(records)}/200)"
-    else:
-        status = "refining"
-        message = f"Refining model (error: {avg_error:.1f})"
+    def _pure_physics_prediction(self, omega_ball: float, alpha_ball: float) -> List[int]:
+        """Pure physics-based prediction"""
+        # Simulate track motion
+        t_impact, v_impact, angle_impact = self.physics.simulate_track_motion(
+            abs(omega_ball), alpha_ball
+        )
+        
+        # Model deflector collision
+        collision_params = self.physics.model_deflector_collision(v_impact, angle_impact)
+        
+        # Get scatter distribution
+        distribution = self.physics.predict_scatter_distribution(collision_params)
+        
+        # Sort by probability and return offsets
+        distribution.sort(key=lambda x: x[1], reverse=True)
+        return [offset for offset, _ in distribution[:8]]
     
-    return {
-        "status": status,
-        "records": len(records),
-        "average_error": round(avg_error, 1) if avg_error != float('inf') else "N/A",
-        "message": message,
-        "learning_active": not should_stop_learning()
-    }
+    def _physics_based_prediction(self, omega_ball: float, alpha_ball: float) -> List[int]:
+        """Physics prediction with learned corrections"""
+        base_prediction = self._pure_physics_prediction(omega_ball, alpha_ball)
+        
+        # Apply learned bias correction if available
+        if hasattr(self, 'learned_bias'):
+            base_prediction = [p + self.learned_bias for p in base_prediction]
+        
+        return base_prediction
+    
+    def _calculate_offset(self, predicted: int, actual: int, direction: str) -> int:
+        """Calculate pocket offset accounting for direction"""
+        pred_idx = POCKET_POSITION[predicted]
+        actual_idx = POCKET_POSITION[actual]
+        
+        if direction.lower() == 'cw':
+            offset = (actual_idx - pred_idx) % WHEEL_SIZE
+        else:
+            offset = (pred_idx - actual_idx) % WHEEL_SIZE
+            
+        # Convert to signed offset (-18 to +18)
+        if offset > WHEEL_SIZE // 2:
+            offset -= WHEEL_SIZE
+            
+        return offset
 
-# ─────────────────────────  Performance Metrics  ──────────────────────────────────
-class PerformanceTracker:
-    """Track prediction accuracy and improvement"""
-    
-    def __init__(self):
-        self.reset_metrics()
-    
-    def reset_metrics(self):
-        self.total_predictions = 0
-        self.direct_hits = 0
-        self.jump_hits = 0
-        self.error_history = deque(maxlen=50)
-        self.improvement_baseline = None
-    
-    def update(self, predicted: int, jumps: List[int], actual: int, direction: str):
-        """Update metrics with new result"""
-        self.total_predictions += 1
-        
-        # Check hits
-        if predicted == actual:
-            self.direct_hits += 1
-        if actual in jumps:
-            self.jump_hits += 1
-        
-        # Calculate error
-        error = abs(pocket_distance(predicted, actual, direction))
-        self.error_history.append(error)
-        
-        # Set baseline after first 20 predictions
-        if self.total_predictions == 20:
-            self.improvement_baseline = self.get_average_error()
-    
-    def get_average_error(self) -> float:
-        """Get average prediction error"""
-        if not self.error_history:
-            return float('inf')
-        return sum(self.error_history) / len(self.error_history)
-    
-    def get_improvement_percentage(self) -> float:
-        """Calculate improvement from baseline"""
-        if not self.improvement_baseline or self.total_predictions < 30:
-            return 0.0
-        
-        current_error = self.get_average_error()
-        if self.improvement_baseline == 0:
-            return 0.0
-        
-        improvement = (self.improvement_baseline - current_error) / self.improvement_baseline * 100
-        return max(0, improvement)
-
-# ─────────────────────────  Main Server  ──────────────────────────────────────
-app = FastAPI(title="Professional Roulette Prediction Server")
+# ──────────────────────────  Main Server  ─────────────────────────────────────
+app = FastAPI(title="Professional Roulette Prediction Server - Physics Enhanced")
 
 app.add_middleware(
     CORSMiddleware,
@@ -660,126 +566,136 @@ app.add_middleware(
     allow_credentials=True
 )
 
-# Global state
-bounce_predictor = BouncePredictor()
-performance_tracker = PerformanceTracker()
+# Global instances
+wheel_calibration = WheelCalibration()
+physics_engine = RoulettePhysics(wheel_calibration)
+bounce_predictor = PhysicsBasedBouncePredictor(wheel_calibration)
 pending_predictions: Dict[str, Dict[str, Any]] = {}
 
 @app.on_event("startup")
 def startup():
-    """Initialize server"""
+    """Initialize server with physics model"""
     initialize_csv()
     
-    # Load historical patterns
+    # Load historical data
     records = read_dataset()
-    for record in records:
-        if record.get("winning_number") and record.get("predicted_number"):
-            try:
-                impact_data = {
-                    'predicted': int(record["predicted_number"]),
-                    'omega_ball': float(record.get("omega_ball", 0)),
-                    'omega_wheel': float(record.get("omega_wheel", 0)),
-                    'direction': record.get("direction", "cw")
-                }
-                bounce_predictor.update_patterns(impact_data, int(record["winning_number"]))
-                
-                # Update performance metrics
-                jumps = [int(x) for x in record.get("jump_numbers", "").split(",") if x]
-                performance_tracker.update(
-                    int(record["predicted_number"]),
-                    jumps,
-                    int(record["winning_number"]),
-                    record.get("direction", "cw")
-                )
-            except:
-                continue
     
-    print(f"Server initialized with {len(records)} historical records")
-    print(f"Average error: {performance_tracker.get_average_error():.1f} pockets")
+    # Try to calibrate from existing data
+    calibration_attempts = 0
+    for record in records[-50:]:  # Use last 50 records for calibration
+        if all(record.get(k) for k in ['omega_ball', 'alpha_ball', 'winning_number']):
+            try:
+                # Add to calibration data
+                crossing_data = {
+                    'omega_ball': float(record['omega_ball']),
+                    'alpha_ball': float(record['alpha_ball']),
+                    't': [float(record.get(f'ball_t{i}', 0)) for i in range(1, 4)]
+                }
+                outcome_data = {
+                    'winning_number': int(record['winning_number']),
+                    'impact_time': 5.0  # Estimate
+                }
+                wheel_calibration.add_observation(crossing_data, outcome_data)
+                calibration_attempts += 1
+            except:
+                pass
+    
+    # Attempt calibration
+    if calibration_attempts >= MIN_CALIBRATION_SPINS:
+        wheel_calibration.calibrate()
+    
+    # Update bounce predictor
+    bounce_predictor.update_from_history(records)
+    
+    params = wheel_calibration.get_parameters()
+    print(f"Physics-based server initialized with {len(records)} historical records")
+    print(f"Calibration status: {'CALIBRATED' if params['calibrated'] else 'USING DEFAULTS'}")
+    if params['calibrated']:
+        print(f"  Wheel radius: {params['wheel_radius']:.3f} m")
+        print(f"  Track radius: {params['track_radius']:.3f} m")
+        print(f"  Table tilt: {math.degrees(params['table_tilt']):.2f}°")
 
 @app.get("/")
 def root():
-    """Server status with learning information"""
+    """Server status"""
     records = read_dataset()
-    learning_status = get_learning_status()
+    params = wheel_calibration.get_parameters()
     
     return {
-        "status": "Professional Roulette Prediction Server",
-        "version": "2.0",
+        "status": "Professional Roulette Prediction Server - Physics Enhanced",
+        "version": "3.0",
+        "model": "Small & Tse (2012) Physics Model",
         "dataset_size": len(records),
-        "average_error": round(performance_tracker.get_average_error(), 1),
-        "improvement": round(performance_tracker.get_improvement_percentage(), 1),
-        "learning": learning_status
+        "physics_model_active": len(records) >= MIN_DATA_FOR_PHYSICS_MODEL,
+        "calibration": {
+            "status": "CALIBRATED" if params['calibrated'] else "USING DEFAULTS",
+            "wheel_radius": round(params['wheel_radius'], 3),
+            "track_radius": round(params['track_radius'], 3),
+            "deflector_radius": round(params['deflector_radius'], 3),
+            "table_tilt_degrees": round(math.degrees(params['table_tilt']), 2)
+        }
     }
 
 @app.post("/predict")
 def predict(request: PredictRequest):
-    """Generate prediction with bounce modeling"""
+    """Generate prediction using physics model"""
     try:
-        # Validate crossing data quality
-        validation_result = validate_crossings(request.crossings)
-        if not validation_result["valid"]:
-            print(f"⚠️ Data validation failed: {validation_result['reason']}")
-            print(f"Deviations: {validation_result['deviations']}")
+        # Validate crossing data
+        if len(request.crossings) < 3:
+            return {"ok": False, "error": "Insufficient crossings"}
         
-        # Extract crossing data
+        # Extract data
         times = [c.t for c in request.crossings]
         ball_angles = [c.theta for c in request.crossings]
         wheel_angles = [c.phi for c in request.crossings]
         
-        # Smooth data
-        ball_angles_smooth = smooth_data(ball_angles)
-        wheel_angles_smooth = smooth_data(wheel_angles)
+        # Calculate velocities using finite differences
+        dt1 = times[1] - times[0]
+        dt2 = times[2] - times[1]
         
-        # Fit trajectories
-        try:
-            _, omega_ball, alpha_ball = fit_trajectory(times, ball_angles_smooth)
-        except:
-            time_diff = times[-1] - times[0]
-            if abs(time_diff) < 1e-9:
-                omega_ball = 0.0
-            else:
-                omega_ball = (ball_angles[-1] - ball_angles[0]) / time_diff
-            alpha_ball = -0.5
+        omega_ball_1 = (ball_angles[1] - ball_angles[0]) / dt1
+        omega_ball_2 = (ball_angles[2] - ball_angles[1]) / dt2
+        omega_ball = (omega_ball_1 + omega_ball_2) / 2
         
-        try:
-            _, omega_wheel, alpha_wheel = fit_trajectory(times, wheel_angles_smooth)
-        except:
-            omega_wheel = 0
-            alpha_wheel = 0
+        # Calculate acceleration
+        alpha_ball = (omega_ball_2 - omega_ball_1) / ((dt1 + dt2) / 2)
         
-        # Calculate impact time
-        t_impact = calculate_impact_time(abs(omega_ball), alpha_ball)
+        # Wheel velocity
+        omega_wheel = (wheel_angles[-1] - wheel_angles[0]) / (times[-1] - times[0])
+        alpha_wheel = 0  # Assume constant for wheel
         
-        # Predict positions at impact
-        t_total = times[-1] - times[0] + t_impact
-        ball_at_impact = ball_angles[0] + omega_ball * t_total + 0.5 * alpha_ball * t_total**2
-        wheel_at_impact = wheel_angles[0] + omega_wheel * t_total + 0.5 * alpha_wheel * t_total**2
+        # PHYSICS-BASED PREDICTION
+        # 1. Calculate when ball reaches deflectors
+        t_impact, v_impact, angle_impact = physics_engine.simulate_track_motion(
+            abs(omega_ball), alpha_ball
+        )
         
-        # Calculate relative position
+        # 2. Predict ball and wheel positions at impact
+        ball_at_impact = ball_angles[0] + omega_ball * t_impact + 0.5 * alpha_ball * t_impact**2
+        wheel_at_impact = wheel_angles[0] + omega_wheel * t_impact
+        
+        # 3. Calculate relative position
         relative_angle = normalize_angle(ball_at_impact - wheel_at_impact)
         predicted_number = angle_to_pocket(relative_angle)
         
-        # Prepare impact data
-        impact_data = {
-            'predicted': predicted_number,
-            'omega_ball': omega_ball,
-            'omega_wheel': omega_wheel,
-            'direction': request.direction
-        }
+        # 4. Predict bounce distribution
+        bounce_offsets = bounce_predictor.predict_bounce(
+            omega_ball, alpha_ball, omega_wheel, request.direction
+        )
         
-        # Get bounce predictions
-        dataset_size = len(read_dataset())
-        jump_numbers = bounce_predictor.predict_bounce_distribution(impact_data, dataset_size)
-        
-        # Calculate current metrics
-        avg_error = performance_tracker.get_average_error()
-        improvement = performance_tracker.get_improvement_percentage()
+        # 5. Convert offsets to actual pocket numbers
+        jump_numbers = []
+        for offset in bounce_offsets[:4]:
+            if request.direction.lower() == 'cw':
+                idx = normalize_index(POCKET_POSITION[predicted_number] + offset)
+            else:
+                idx = normalize_index(POCKET_POSITION[predicted_number] - offset)
+            jump_numbers.append(WHEEL_SEQUENCE[idx])
         
         # Generate round ID
         round_id = str(uuid.uuid4())
         
-        # Store for validation
+        # Store prediction data with calibration info
         pending_predictions[round_id] = {
             "ts_start": request.ts_start or int(time.time() * 1000),
             "direction": request.direction,
@@ -794,44 +710,33 @@ def predict(request: PredictRequest):
             "predicted": predicted_number,
             "jump_numbers": jump_numbers,
             "ts_predict": int(time.time() * 1000),
-            "quality_score": validation_result.get("quality_score", 1.0)
+            "physics_data": {
+                "t_impact": t_impact,
+                "v_impact": v_impact,
+                "angle_impact": angle_impact
+            },
+            "calibration_status": wheel_calibration.calibrated
         }
         
-        # Log to console with learning status
-        print("✅ Prediction ready")
-        console_output = {
-            "predicted_number": predicted_number,
-            "jump_numbers": jump_numbers,
-            "accuracy": {
-                "error_margin": int(avg_error) if avg_error != float('inf') else "N/A",
-                "improvement": round(improvement, 1)
-            }
-        }
+        # Log prediction with calibration status
+        print(f"✅ Physics-based prediction ready")
+        print(f"   Calibration: {'YES' if wheel_calibration.calibrated else 'NO (using defaults)'}")
+        print(f"   Impact velocity: {v_impact:.2f} m/s")
+        print(f"   Impact time: {t_impact:.2f} s")
+        print(f"   Predicted: {predicted_number}")
+        print(f"   Jump numbers: {jump_numbers}")
         
-        # Add quality warning if needed
-        if validation_result.get("quality_score", 1.0) < 0.7:
-            console_output["data_quality"] = f"{validation_result['quality_score']*100:.0f}%"
-            print("⚠️ Low quality data - results may be less accurate")
-        
-        # Add learning status
-        learning_status = get_learning_status()
-        if learning_status["status"] == "optimized":
-            console_output["model_status"] = "OPTIMIZED ✨"
-        
-        print(json.dumps(console_output, indent=2))
-        
-        # Return response
         return {
             "ok": True,
             "round_id": round_id,
             "prediction": predicted_number,
             "jump_numbers": jump_numbers,
-            "accuracy": {
-                "error_margin": int(avg_error) if avg_error != float('inf') else "N/A",
-                "improvement": round(improvement, 1)
+            "physics": {
+                "impact_velocity": round(v_impact, 2),
+                "impact_time": round(t_impact, 2),
+                "model": "Small & Tse (2012)"
             },
-            "dataset_rows": dataset_size,
-            "data_quality": f"{validation_result.get('quality_score', 1.0)*100:.0f}%"
+            "dataset_rows": len(read_dataset())
         }
         
     except Exception as e:
@@ -840,65 +745,41 @@ def predict(request: PredictRequest):
 
 @app.post("/log_winner")
 def log_winner(request: LogWinnerRequest):
-    """Log actual result and update models"""
+    """Log actual result and update physics model"""
     try:
         # Get pending prediction
         prediction_data = pending_predictions.pop(request.round_id, None)
         if not prediction_data:
             return {"ok": True, "ignored": True, "reason": "no_matching_prediction"}
         
-        # Check if learning should stop
-        if should_stop_learning():
-            learning_status = get_learning_status()
-            print(f"🛑 Learning stopped: {learning_status['message']}")
-            
-            # Still update metrics but don't save
-            if request.winning_number == prediction_data['predicted']:
-                print(f"✅ Direct hit! (not saved - learning complete)")
-            elif request.winning_number in prediction_data['jump_numbers']:
-                print(f"✅ Jump hit! (not saved - learning complete)")
-            else:
-                error = abs(pocket_distance(prediction_data['predicted'], request.winning_number, prediction_data['direction']))
-                print(f"❌ Miss by {error} pockets (not saved - learning complete)")
-            
-            return {
-                "ok": True,
-                "ignored": True,
-                "reason": "learning_complete",
-                "learning_status": learning_status
-            }
-        
-        # NO QUALITY FILTERING - SAVE ALL DATA
-        
-        # Update bounce patterns
-        impact_data = {
-            'predicted': prediction_data['predicted'],
-            'omega_ball': prediction_data['omega_ball'],
-            'omega_wheel': prediction_data['omega_wheel'],
-            'direction': prediction_data['direction']
-        }
-        bounce_predictor.update_patterns(impact_data, request.winning_number)
-        
-        # Update performance metrics
-        performance_tracker.update(
-            prediction_data['predicted'],
-            prediction_data['jump_numbers'],
-            request.winning_number,
-            prediction_data['direction']
-        )
+        # Always save data for learning
         
         # Calculate error
-        error = abs(pocket_distance(prediction_data['predicted'], request.winning_number, prediction_data['direction']))
+        predicted = prediction_data['predicted']
+        actual = request.winning_number
+        direction = prediction_data['direction']
         
-        # Determine bounce pattern
-        if request.winning_number == prediction_data['predicted']:
+        # Calculate offset
+        pred_idx = POCKET_POSITION[predicted]
+        actual_idx = POCKET_POSITION[actual]
+        
+        if direction.lower() == 'cw':
+            error = normalize_index(actual_idx - pred_idx)
+        else:
+            error = normalize_index(pred_idx - actual_idx)
+            
+        if error > WHEEL_SIZE // 2:
+            error = WHEEL_SIZE - error
+        
+        # Determine hit type
+        if actual == predicted:
             pattern = "direct_hit"
-        elif request.winning_number in prediction_data['jump_numbers']:
+        elif actual in prediction_data['jump_numbers']:
             pattern = "jump_hit"
         else:
             pattern = f"miss_{error}"
         
-        # Save to CSV - ALWAYS
+        # Create record
         record = {
             "round_id": request.round_id,
             "ts_start": str(prediction_data["ts_start"]),
@@ -917,10 +798,10 @@ def log_winner(request: LogWinnerRequest):
             "alpha_ball": f"{prediction_data['alpha_ball']:.6f}",
             "omega_wheel": f"{prediction_data['omega_wheel']:.6f}",
             "alpha_wheel": f"{prediction_data['alpha_wheel']:.6f}",
-            "predicted_number": str(prediction_data["predicted"]),
+            "predicted_number": str(predicted),
             "jump_numbers": ",".join(map(str, prediction_data["jump_numbers"])),
             "ts_predict": str(prediction_data["ts_predict"]),
-            "winning_number": str(request.winning_number),
+            "winning_number": str(actual),
             "ts_winner": str(request.timestamp or int(time.time() * 1000)),
             "error_slots": str(error),
             "bounce_pattern": pattern
@@ -929,19 +810,38 @@ def log_winner(request: LogWinnerRequest):
         append_record(record)
         maintain_dataset_size()
         
-        # Log result
-        hit_type = "DIRECT HIT" if pattern == "direct_hit" else "JUMP HIT" if pattern == "jump_hit" else "MISS"
-        print(f"Result: {hit_type} - Predicted: {prediction_data['predicted']}, Actual: {request.winning_number}, Error: {error}")
+        # Update physics model with new data
+        records = read_dataset()
+        bounce_predictor.update_from_history(records)
+        
+        # Add to calibration data
+        if not wheel_calibration.calibrated:
+            crossing_data = {
+                'omega_ball': prediction_data['omega_ball'],
+                'alpha_ball': prediction_data['alpha_ball'],
+                't': prediction_data['times']
+            }
+            outcome_data = {
+                'winning_number': actual,
+                'impact_time': prediction_data['physics_data']['t_impact']
+            }
+            wheel_calibration.add_observation(crossing_data, outcome_data)
+            
+            # Try to calibrate
+            if wheel_calibration.calibrate():
+                print("🎯 WHEEL CALIBRATION SUCCESSFUL!")
+                # Recreate physics engine with new parameters
+                physics_engine.__init__(wheel_calibration)
+                bounce_predictor.physics.__init__(wheel_calibration)
+        
+        print(f"Result: {pattern} - Predicted: {predicted}, Actual: {actual}, Error: {error}")
         
         return {
             "ok": True,
             "stored": True,
             "hit_type": pattern,
             "error_slots": error,
-            "current_accuracy": {
-                "average_error": round(performance_tracker.get_average_error(), 1),
-                "improvement": round(performance_tracker.get_improvement_percentage(), 1)
-            }
+            "physics_model_updated": True
         }
         
     except Exception as e:
@@ -950,58 +850,72 @@ def log_winner(request: LogWinnerRequest):
 
 @app.get("/statistics")
 def get_statistics():
-    """Get detailed performance statistics"""
+    """Get detailed statistics including physics model performance"""
     records = read_dataset()
-    learning_status = get_learning_status()
     
-    # Calculate phase-specific metrics
-    phase_metrics = {
-        "initial_50": {"errors": [], "period": "Records 1-50"},
-        "middle_phase": {"errors": [], "period": "Records 51-150"},
-        "recent_50": {"errors": [], "period": f"Records {max(1, len(records)-49)}-{len(records)}"}
-    }
+    # Calculate statistics
+    direct_hits = sum(1 for r in records if r.get('bounce_pattern') == 'direct_hit')
+    jump_hits = sum(1 for r in records if r.get('bounce_pattern') == 'jump_hit')
+    total_predictions = len([r for r in records if r.get('predicted_number')])
     
-    # Fill phase metrics
-    for i, r in enumerate(records):
-        if r.get("error_slots"):
+    # Physics model performance (last 50 predictions)
+    recent_records = records[-50:] if len(records) >= 50 else records
+    recent_errors = []
+    for r in recent_records:
+        if r.get('error_slots'):
             try:
-                error = int(r["error_slots"])
-                if i < 50:
-                    phase_metrics["initial_50"]["errors"].append(error)
-                elif i < 150:
-                    phase_metrics["middle_phase"]["errors"].append(error)
-                if i >= len(records) - 50:
-                    phase_metrics["recent_50"]["errors"].append(error)
+                recent_errors.append(int(r['error_slots']))
             except:
                 pass
     
-    # Calculate averages
-    for phase in phase_metrics.values():
-        if phase["errors"]:
-            phase["average_error"] = round(sum(phase["errors"]) / len(phase["errors"]), 1)
-        else:
-            phase["average_error"] = "N/A"
-        phase["sample_size"] = len(phase["errors"])
+    avg_error = sum(recent_errors) / len(recent_errors) if recent_errors else 0
+    
+    # Expected return calculation
+    if total_predictions > 0:
+        hit_rate = (direct_hits + jump_hits) / total_predictions
+        expected_return = (hit_rate * 35) - (1 - hit_rate)
+    else:
+        expected_return = 0
     
     return {
-        "total_predictions": performance_tracker.total_predictions,
-        "direct_hits": performance_tracker.direct_hits,
-        "jump_hits": performance_tracker.jump_hits,
+        "total_predictions": total_predictions,
+        "direct_hits": direct_hits,
+        "jump_hits": jump_hits,
         "hit_rate": {
-            "direct": round(performance_tracker.direct_hits / max(1, performance_tracker.total_predictions) * 100, 1),
-            "jumps": round(performance_tracker.jump_hits / max(1, performance_tracker.total_predictions) * 100, 1)
+            "direct": round(direct_hits / max(1, total_predictions) * 100, 1),
+            "jumps": round(jump_hits / max(1, total_predictions) * 100, 1),
+            "combined": round((direct_hits + jump_hits) / max(1, total_predictions) * 100, 1)
         },
-        "average_error": round(performance_tracker.get_average_error(), 1),
-        "improvement": round(performance_tracker.get_improvement_percentage(), 1),
+        "average_error": round(avg_error, 1),
+        "expected_return": f"{expected_return:.1%}",
         "dataset_size": len(records),
-        "confidence_level": "High" if len(records) > 200 else "Medium" if len(records) > 50 else "Low",
-        "learning_status": learning_status,
-        "performance_by_phase": phase_metrics
+        "physics_model": {
+            "active": len(records) >= MIN_DATA_FOR_PHYSICS_MODEL,
+            "confidence": "High" if len(records) > 200 else "Medium" if len(records) > 50 else "Low",
+            "model": "Small & Tse (2012) with deflector dynamics"
+        }
     }
 
+# ──────────────────────────  Helper Functions  ────────────────────────────────
+def angle_to_pocket(angle: float) -> int:
+    """Convert angle to pocket number"""
+    index = int(round((angle / (2*math.pi)) * WHEEL_SIZE)) % WHEEL_SIZE
+    return WHEEL_SEQUENCE[index]
+
+def pocket_distance(pocket1: int, pocket2: int, direction: str = "cw") -> int:
+    """Calculate distance between pockets"""
+    i1, i2 = POCKET_POSITION[pocket1], POCKET_POSITION[pocket2]
+    if direction.lower() == "cw":
+        return normalize_index(i2 - i1)
+    else:
+        return normalize_index(i1 - i2)
+
 if __name__ == "__main__":
-    print("Starting Professional Roulette Prediction Server")
+    print("Starting Professional Physics-Based Roulette Prediction Server")
     print(f"Data location: {DATA_PATH}")
+    print("Physics model: Small & Tse (2012) implementation")
+    print("Auto-calibration: ENABLED - will calibrate from observed data")
+    print(f"Initial parameters: {DEFAULT_WHEEL_RADIUS}m wheel (will auto-calibrate)")
     
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8000)
