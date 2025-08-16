@@ -1,13 +1,16 @@
-# Roulette Prediction Server
+# Roulette Prediction Server v17
 
-FastAPI service that predicts the roulette pocket using three ball crossings.
-* Returns **prediction** immediately.
-* After 60 valid rows with good accuracy adds `periskok` – 4 pockets adjusted for jump bias.
-* Stores only valid rounds, keeps dataset under 600 rows and self‑prunes when mean error grows.
+FastAPI server for roulette prediction based on ball speed and traveled pockets pattern matching.
 
-## Quick start
-```bash
-python -m venv venv && source venv/bin/activate
-pip install -r requirements.txt
-uvicorn server:app --host 0.0.0.0 --port 8000
-```
+## Method
+- Tracks ball speed (ms) between timestamp1 and timestamp2
+- Counts traveled pockets during one rotation
+- Matches historical patterns to predict outcome
+- Self-learning system with automatic optimization
+
+## Features
+- ✅ Pattern matching with ±50ms speed tolerance
+- ✅ Intelligent learning control (stops at ≤4 pockets error)
+- ✅ Poor quality data filtering
+- ✅ Real-time performance tracking
+- ✅ Dataset size management (max 5000 records)
