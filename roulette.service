@@ -1,13 +1,15 @@
 [Unit]
-Description=Roulette Prediction Server
+Description=Roulette Prediction Server v17
 After=network.target
 
 [Service]
 Type=simple
 User=www-data
-WorkingDirectory=/opt/roulette
-ExecStart=/usr/bin/uvicorn server:app --host 0.0.0.0 --port 8000
+WorkingDirectory=/opt/543vvt
+Environment="ROULETTE_DATA_PATH=/opt/543vvt/.roulette_v17/roulette_v17_data.csv"
+ExecStart=/opt/543vvt/venv/bin/uvicorn server:app --host 0.0.0.0 --port 8000
 Restart=on-failure
+RestartSec=5
 
 [Install]
 WantedBy=multi-user.target
