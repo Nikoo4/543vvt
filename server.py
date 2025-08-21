@@ -1,13 +1,4 @@
-
-"""
-Roulette Prediction Server v18 - Professional Edition
-Changes from v17:
-- Expanded speed bucket search [-2..+2]
-- Speed tolerance raised to 80 ms (from 50)
-- Lowered MIN_PATTERN_CONFIDENCE to 0.40 (from 0.60)
-- Circular standard deviation for pockets_to_winner (correct for wrap-around)
-- No changes to request/response models or endpoints (drop-in replacement)
-"""
+"""Server-side predictor & dataset storage."""
 
 import os
 import csv
@@ -69,6 +60,7 @@ CSV_COLUMNS = [
     'pockets_to_winner', 'ball_direction',
     'timestamp1_number', 'timestamp2_number', 'winning_number',
     'timestamp1_position_x', 'timestamp1_position_y',
+    'timestamp2_position_x', 'timestamp2_position_y',
     'predicted_number', 'prediction_error', 'confidence'
 ]
 
@@ -251,7 +243,18 @@ class PatternEngine:
                 key = f"{speed_bucket}_{record['traveled_pockets']}_{record['ball_direction']}"
                 self.pattern_cache[key].append(record)
 
-    def find_matches(self, speed: int, pockets: int, direction: str) -> Tuple[List[Dict], float]:
+    def find_matches(self, speed: int, pockets: int, direction: str, req_pos=None) -> Tuple[List[Dict], float]:
+        """Find dataset records that match speed/pockets/direction and are
+        spatially close to the request's T1 position (if provided).
+        Args:
+            speed: ball period in ms per revolution.
+            pockets: traveled pockets between T1 and T2 (expected 7).
+            direction: 'CW' or 'CCW'.
+            req_pos: optional (x, y) in pixels captured at T1.
+        Returns:
+            (matches, confidence)
+        """
+
         matches = []
         speed_bucket = speed // 50
         # Expanded bucket search [-2..+2]
@@ -261,6 +264,18 @@ class PatternEngine:
                 continue
             for record in self.pattern_cache[key]:
                 if abs(record['ball_speed_ms'] - speed) <= SPEED_TOLERANCE_MS:
+                    if req_pos is not None:
+                        rx = record.get('timestamp1_position_x')
+                        ry = record.get('timestamp1_position_y')
+                        if rx in (None, '') or ry in (None, ''):
+                            continue
+                        try:
+                            dx = float(rx) - float(req_pos[0])
+                            dy = float(ry) - float(req_pos[1])
+                        except Exception:
+                            continue
+                        if (dx*dx + dy*dy) ** 0.5 > POSITION_TOLERANCE_PX:
+                            continue
                     matches.append(record)
         if not matches:
             return [], 0.0
@@ -410,6 +425,8 @@ class PredictionSystem:
             'timestamp2_number': request.timestamp2_number,
             'timestamp1_position_x': request.timestamp1_position.get('x') if request.timestamp1_position else None,
             'timestamp1_position_y': request.timestamp1_position.get('y') if request.timestamp1_position else None,
+            'timestamp2_position_x': request.timestamp2_position.get('x') if request.timestamp2_position else None,
+            'timestamp2_position_y': request.timestamp2_position.get('y') if request.timestamp2_position else None,
             'timestamp': time.time()
         }
         dataset_size = len(self.storage.active_dataset)
@@ -421,8 +438,17 @@ class PredictionSystem:
                 'accuracy': {'error_margin': 'N/A', 'success_rate_3': 'N/A'},
                 'data_quality': '0%'
             }
+        req_pos = None
+        if request.timestamp1_position:
+            req_pos = (
+                request.timestamp1_position.get('x'),
+                request.timestamp1_position.get('y')
+            )
         matches, confidence = self.pattern_engine.find_matches(
-            request.ball_speed_ms, request.traveled_pockets, request.ball_direction
+            request.ball_speed_ms,
+            request.traveled_pockets,
+            request.ball_direction,
+            req_pos
         )
         if not matches or confidence < MIN_PATTERN_CONFIDENCE:
             return {
@@ -480,6 +506,8 @@ class PredictionSystem:
             'winning_number': winning_number,
             'timestamp1_position_x': pending.get('timestamp1_position_x', ''),
             'timestamp1_position_y': pending.get('timestamp1_position_y', ''),
+            'timestamp2_position_x': pending.get('timestamp2_position_x', ''),
+            'timestamp2_position_y': pending.get('timestamp2_position_y', ''),
             'predicted_number': predicted_number if predicted_number is not None else '',
             'prediction_error': prediction_error if prediction_error is not None else '',
             'confidence': prediction_data['confidence'] if prediction_data else ''
