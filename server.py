@@ -1,6 +1,12 @@
+
 """
-Roulette Prediction Server v17 - Professional Edition
-Advanced pattern matching with intelligent data management
+Roulette Prediction Server v18 - Professional Edition
+Changes from v17:
+- Expanded speed bucket search [-2..+2]
+- Speed tolerance raised to 80 ms (from 50)
+- Lowered MIN_PATTERN_CONFIDENCE to 0.40 (from 0.60)
+- Circular standard deviation for pockets_to_winner (correct for wrap-around)
+- No changes to request/response models or endpoints (drop-in replacement)
 """
 
 import os
@@ -8,21 +14,21 @@ import csv
 import json
 import time
 import logging
+import math
 from datetime import datetime
 from collections import deque, defaultdict
 from typing import List, Dict, Any, Optional, Tuple
-from statistics import mean, median, stdev
+from statistics import mean, median
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, Field
+from pydantic import BaseModel
 
-# Configure logging
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
-logger = logging.getLogger("RouletteV17Pro")
+logger = logging.getLogger("RouletteV18Pro")
 
 # ═══════════════════════ Configuration ═══════════════════════
 
@@ -32,25 +38,24 @@ OPTIMAL_DATA_SIZE = 1500        # Target for good accuracy
 MAX_DATASET_SIZE = 3000         # Maximum records to keep
 CLEANUP_THRESHOLD = 2500        # Start cleanup when reaching this
 
-
 # Speed gate: ignore spins that are too fast/unstable for T1→T2 (ms)
 MIN_BALL_SPEED_MS = 450  # below this, ignore for prediction & dataset
-# Matching parameters
-SPEED_TOLERANCE_MS = 50         # ±50ms for speed matching
-POSITION_TOLERANCE_PX = 30      # ±30px for position matching
 
-# Quality parameters
+# Matching parameters (RELAXED vs v17)
+SPEED_TOLERANCE_MS = 80         # ±80ms for speed matching (was 50)
+POSITION_TOLERANCE_PX = 30      # unchanged
+
+# Quality parameters (RELAXED vs v17)
 TARGET_ERROR = 3.0              # Target error in pockets
 MAX_ACCEPTABLE_ERROR = 10.0     # Maximum acceptable error
-MIN_PATTERN_CONFIDENCE = 0.6    # Minimum confidence to predict
+MIN_PATTERN_CONFIDENCE = 0.40   # (was 0.60)
 
 # Learning parameters
 MAINTENANCE_INTERVAL = 100      # Check quality every N records
 PATTERN_MIN_SAMPLES = 5         # Minimum samples to evaluate pattern
 HISTORY_SIZE = 100              # Size of prediction history
 
-# CSV Configuration
-# --- Runtime overrides via environment variables (optional) ---
+# Runtime overrides via environment variables (optional)
 MIN_DATA_FOR_PREDICTION = int(os.getenv("MIN_DATA_FOR_PREDICTION", MIN_DATA_FOR_PREDICTION))
 OPTIMAL_DATA_SIZE = int(os.getenv("OPTIMAL_DATA_SIZE", OPTIMAL_DATA_SIZE))
 MAX_DATASET_SIZE = int(os.getenv("MAX_DATASET_SIZE", MAX_DATASET_SIZE))
@@ -77,7 +82,7 @@ def get_data_path() -> str:
         os.path.join("/tmp", "roulette_v17_pro.csv"),
         os.path.join(".", "roulette_v17_pro.csv")
     ]
-    
+
     for path in candidates:
         if not path:
             continue
@@ -85,20 +90,21 @@ def get_data_path() -> str:
             directory = os.path.dirname(path)
             if directory and not os.path.exists(directory):
                 os.makedirs(directory, exist_ok=True)
-            
+
             with open(path, 'a', encoding='utf-8') as f:
                 pass
-            
+
             if os.path.getsize(path) == 0:
                 with open(path, 'w', newline='', encoding='utf-8') as f:
-                    writer = csv.writer(f)
+                    import csv as _csv
+                    writer = _csv.writer(f)
                     writer.writerow(CSV_COLUMNS)
-            
+
             logger.info(f"Using data path: {path}")
             return path
         except Exception as e:
             logger.warning(f"Cannot use path {path}: {e}")
-    
+
     raise RuntimeError("No writable location found for CSV data")
 
 DATA_PATH = get_data_path()
@@ -111,33 +117,26 @@ EUROPEAN_WHEEL = [
     13, 36, 11, 30, 8, 23, 10, 5, 24, 16, 33, 1,
     20, 14, 31, 9, 22, 18, 29, 7, 28, 12, 35, 3, 26
 ]
-
 POCKET_INDICES = {num: i for i, num in enumerate(EUROPEAN_WHEEL)}
 
 def calculate_pocket_distance(from_number: int, to_number: int, direction: str) -> int:
-    """Calculate distance between two pockets"""
+    """Distance between two pockets in given direction (0..36)"""
     from_idx = POCKET_INDICES[from_number]
     to_idx = POCKET_INDICES[to_number]
-    
     if direction.upper() == "CW":
-        distance = (to_idx - from_idx) % 37
-    else:
-        distance = (from_idx - to_idx) % 37
-    
-    return distance
+        return (to_idx - from_idx) % 37
+    return (from_idx - to_idx) % 37
 
 def get_number_at_offset(from_number: int, offset: int, direction: str) -> int:
-    """Get pocket number at given offset"""
+    """Get pocket number at given offset in given direction"""
     from_idx = POCKET_INDICES[from_number]
-    
     if direction.upper() == "CW":
         target_idx = (from_idx + offset) % 37
     else:
         target_idx = (from_idx - offset) % 37
-    
     return EUROPEAN_WHEEL[target_idx]
 
-# ═══════════════════════ Request/Response Models ═══════════════════════
+# ═══════════════════════ Models ═══════════════════════
 
 class PredictionRequest(BaseModel):
     round_id: str
@@ -153,53 +152,50 @@ class LogWinnerRequest(BaseModel):
     round_id: str
     winning_number: int
 
-# ═══════════════════════ Data Storage System ═══════════════════════
+# ═══════════════════════ Data Storage ═══════════════════════
 
 class DataStorage:
-    """Manages data storage and retrieval"""
-    
     def __init__(self):
         self.active_dataset = []
         self.pending_round = None
         self.load_dataset()
-    
+
     def load_dataset(self):
-        """Load dataset from CSV"""
         if not os.path.exists(DATA_PATH):
             self.active_dataset = []
             return
-        
         try:
             with open(DATA_PATH, 'r', encoding='utf-8') as f:
                 reader = csv.DictReader(f)
                 self.active_dataset = []
                 for row in reader:
-                    # Convert numeric fields
+                    # coerce ints
                     for field in ['ball_speed_ms', 'traveled_pockets', 'pockets_to_winner',
-                                 'timestamp1_number', 'timestamp2_number', 'winning_number',
-                                 'predicted_number', 'prediction_error']:
-                        if field in row and row[field]:
+                                  'timestamp1_number', 'timestamp2_number', 'winning_number']:
+                        if row.get(field, '') != '':
                             try:
                                 row[field] = int(row[field])
-                            except ValueError:
+                            except Exception:
                                 pass
-                    
+                    for field in ['predicted_number', 'prediction_error']:
+                        if row.get(field, '') != '':
+                            try:
+                                row[field] = int(row[field])
+                            except Exception:
+                                pass
                     for field in ['confidence', 'timestamp1_position_x', 'timestamp1_position_y']:
-                        if field in row and row[field]:
+                        if row.get(field, '') != '':
                             try:
                                 row[field] = float(row[field])
-                            except ValueError:
+                            except Exception:
                                 pass
-                    
                     self.active_dataset.append(row)
-            
             logger.info(f"Loaded {len(self.active_dataset)} records from CSV")
         except Exception as e:
             logger.error(f"Error loading CSV: {e}")
             self.active_dataset = []
-    
+
     def save_record(self, record: Dict):
-        """Append single record to CSV"""
         try:
             with open(DATA_PATH, 'a', newline='', encoding='utf-8') as f:
                 writer = csv.DictWriter(f, fieldnames=CSV_COLUMNS)
@@ -207,262 +203,191 @@ class DataStorage:
             self.active_dataset.append(record)
         except Exception as e:
             logger.error(f"Error saving record: {e}")
-    
+
     def rewrite_dataset(self):
-        """Rewrite entire CSV with current dataset"""
         try:
-            # Create backup first
             if os.path.exists(DATA_PATH):
                 import shutil
                 shutil.copy2(DATA_PATH, BACKUP_PATH)
-            
             with open(DATA_PATH, 'w', newline='', encoding='utf-8') as f:
                 writer = csv.DictWriter(f, fieldnames=CSV_COLUMNS)
                 writer.writeheader()
                 writer.writerows(self.active_dataset)
-            
             logger.info(f"Rewrote CSV with {len(self.active_dataset)} records")
         except Exception as e:
             logger.error(f"Error rewriting CSV: {e}")
 
-# ═══════════════════════ Pattern Matching Engine ═══════════════════════
+# ═══════════════════════ Pattern Engine ═══════════════════════
+
+def circular_std(offsets: List[int], modulo: int = 37) -> float:
+    """
+    Circular standard deviation for discrete offsets modulo `modulo`.
+    Returns an equivalent spread in 'pockets' (same units as offsets).
+    """
+    n = len(offsets)
+    if n == 0:
+        return 0.0
+    # Map offsets to angles
+    angles = [2 * math.pi * (o % modulo) / modulo for o in offsets]
+    sum_sin = sum(math.sin(a) for a in angles)
+    sum_cos = sum(math.cos(a) for a in angles)
+    R = (sum_sin ** 2 + sum_cos ** 2) ** 0.5 / n
+    if R <= 0:
+        # maximally dispersed
+        return modulo / math.sqrt(12)  # ~uniform equivalent
+    sigma = ( -2.0 * math.log(R) ) ** 0.5  # in radians
+    std_eq = sigma * modulo / (2 * math.pi)  # convert back to 'pockets'
+    return std_eq
 
 class PatternEngine:
-    """Advanced pattern matching with caching"""
-    
     def __init__(self):
         self.pattern_cache = defaultdict(list)
-        self.quality_index = {}
-        
+
     def rebuild_cache(self, dataset: List[Dict]):
-        """Rebuild pattern cache for fast lookup"""
         self.pattern_cache.clear()
-        
         for record in dataset:
-            if all(key in record for key in ['ball_speed_ms', 'traveled_pockets', 'ball_direction']):
-                # Create cache key with speed buckets
+            if all(k in record for k in ['ball_speed_ms', 'traveled_pockets', 'ball_direction', 'pockets_to_winner']):
                 speed_bucket = record['ball_speed_ms'] // 50
                 key = f"{speed_bucket}_{record['traveled_pockets']}_{record['ball_direction']}"
                 self.pattern_cache[key].append(record)
-    
+
     def find_matches(self, speed: int, pockets: int, direction: str) -> Tuple[List[Dict], float]:
-        """Find matching patterns and calculate confidence"""
         matches = []
         speed_bucket = speed // 50
-        
-        # Check exact and adjacent buckets
-        for bucket_offset in [0, -1, 1]:
-            check_bucket = speed_bucket + bucket_offset
-            key = f"{check_bucket}_{pockets}_{direction}"
-            
-            if key in self.pattern_cache:
-                for record in self.pattern_cache[key]:
-                    if abs(record['ball_speed_ms'] - speed) <= SPEED_TOLERANCE_MS:
-                        matches.append(record)
-        
+        # Expanded bucket search [-2..+2]
+        for bucket_offset in (-2, -1, 0, 1, 2):
+            key = f"{speed_bucket + bucket_offset}_{pockets}_{direction}"
+            if key not in self.pattern_cache:
+                continue
+            for record in self.pattern_cache[key]:
+                if abs(record['ball_speed_ms'] - speed) <= SPEED_TOLERANCE_MS:
+                    matches.append(record)
         if not matches:
             return [], 0.0
-        
-        # Calculate confidence based on sample size and consistency
-        confidence = min(len(matches) / 10, 1.0)  # More samples = higher confidence
-        
+        # Base confidence by sample size (faster ramp)
+        base_conf = min(len(matches) / 8.0, 1.0)
+        conf = base_conf
+        # Consistency by circular spread
         if len(matches) >= 3:
-            offsets = [m['pockets_to_winner'] for m in matches if 'pockets_to_winner' in m]
-            if offsets and len(offsets) >= 3:
-                std_dev = stdev(offsets) if len(offsets) > 1 else 0
-                consistency_factor = max(0, 1 - (std_dev / 10))
-                confidence *= consistency_factor
-        
-        return matches, confidence
-    
+            offsets = [m['pockets_to_winner'] for m in matches]
+            spread = circular_std(offsets, 37)  # in pockets
+            # Map spread to [0..1]: 0 spread -> 1.0, 10 pockets -> 0
+            consistency = max(0.0, 1.0 - (spread / 10.0))
+            conf *= consistency
+        return matches, float(conf)
+
     def predict_offset(self, matches: List[Dict]) -> int:
-        """Calculate weighted average offset"""
         if not matches:
             return 0
-        
-        offsets = []
-        weights = []
-        
-        for match in matches:
-            if 'pockets_to_winner' in match:
-                offset = match['pockets_to_winner']
-                offsets.append(offset)
-                
-                # Weight by inverse of error if available
-                if 'prediction_error' in match and match['prediction_error'] is not None:
-                    error = max(1, match['prediction_error'])
-                    weight = 1.0 / error
-                else:
-                    weight = 1.0
-                
-                weights.append(weight)
-        
-        if not offsets:
-            return 0
-        
-        # Weighted average
-        total_weight = sum(weights)
-        if total_weight > 0:
-            weighted_sum = sum(o * w for o, w in zip(offsets, weights))
-            return int(round(weighted_sum / total_weight))
-        
-        return int(round(mean(offsets)))
+        # Weighted by inverse error if available; else uniform
+        offsets, weights = [], []
+        for m in matches:
+            o = int(m.get('pockets_to_winner', 0))
+            offsets.append(o)
+            err = m.get('prediction_error')
+            w = 1.0 / max(1.0, float(err)) if err not in (None, '') else 1.0
+            weights.append(w)
+        total_w = sum(weights)
+        if total_w <= 0:
+            from statistics import mean as _mean
+            return int(round(_mean(offsets)))
+        weighted = sum(o*w for o, w in zip(offsets, weights)) / total_w
+        return int(round(weighted))
 
-# ═══════════════════════ Quality Management System ═══════════════════════
+# ═══════════════════════ Quality Management ═══════════════════════
 
 class QualityManager:
-    """Manages dataset quality and optimization"""
-    
     def __init__(self):
         self.last_maintenance = 0
-        
+
     def optimize_dataset(self, dataset: List[Dict]) -> List[Dict]:
-        """Optimize dataset by removing poor quality data"""
         if len(dataset) < MIN_DATA_FOR_PREDICTION:
             return dataset
-        
-        # Group by patterns
-        pattern_performance = defaultdict(list)
-        
-        for record in dataset:
-            if all(key in record for key in ['ball_speed_ms', 'traveled_pockets', 'ball_direction']):
-                pattern_key = f"{record['ball_speed_ms']//50}_{record['traveled_pockets']}_{record['ball_direction']}"
-                
-                if 'prediction_error' in record and record['prediction_error'] is not None:
-                    pattern_performance[pattern_key].append({
-                        'error': record['prediction_error'],
-                        'record': record
-                    })
-        
-        # Identify and remove poor patterns
-        cleaned_dataset = []
-        removed_count = 0
-        
-        for record in dataset:
-            pattern_key = f"{record.get('ball_speed_ms', 0)//50}_{record.get('traveled_pockets', 0)}_{record.get('ball_direction', '')}"
-            
-            # Check if pattern is poor
-            if pattern_key in pattern_performance:
-                pattern_data = pattern_performance[pattern_key]
-                if len(pattern_data) >= PATTERN_MIN_SAMPLES:
-                    avg_error = mean([p['error'] for p in pattern_data])
-                    
-                    # Remove if error too high
-                    if avg_error > MAX_ACCEPTABLE_ERROR:
-                        removed_count += 1
-                        continue
-            
-            cleaned_dataset.append(record)
-        
-        if removed_count > 0:
-            logger.info(f"Removed {removed_count} poor quality records")
-        
-        # If dataset still too large, keep only best records
-        if len(cleaned_dataset) > MAX_DATASET_SIZE:
-            # Sort by prediction error (best first)
-            cleaned_dataset.sort(
-                key=lambda x: x.get('prediction_error', MAX_ACCEPTABLE_ERROR)
-            )
-            cleaned_dataset = cleaned_dataset[:MAX_DATASET_SIZE]
-        
-        return cleaned_dataset
-    
+        pattern_perf = defaultdict(list)
+        for r in dataset:
+            if all(k in r for k in ['ball_speed_ms','traveled_pockets','ball_direction']):
+                key = f"{r['ball_speed_ms']//50}_{r['traveled_pockets']}_{r['ball_direction']}"
+                if r.get('prediction_error') not in (None, ''):
+                    try:
+                        pattern_perf[key].append(float(r['prediction_error']))
+                    except Exception:
+                        pass
+        cleaned = []
+        removed = 0
+        for r in dataset:
+            key = f"{r.get('ball_speed_ms',0)//50}_{r.get('traveled_pockets',0)}_{r.get('ball_direction','')}"
+            if key in pattern_perf and len(pattern_perf[key]) >= PATTERN_MIN_SAMPLES:
+                avg_err = sum(pattern_perf[key])/len(pattern_perf[key])
+                if avg_err > MAX_ACCEPTABLE_ERROR:
+                    removed += 1
+                    continue
+            cleaned.append(r)
+        if removed:
+            logger.info(f"Removed {removed} poor quality records")
+        if len(cleaned) > MAX_DATASET_SIZE:
+            cleaned.sort(key=lambda x: float(x.get('prediction_error', MAX_ACCEPTABLE_ERROR)))
+            cleaned = cleaned[:MAX_DATASET_SIZE]
+        return cleaned
+
     def should_optimize(self, dataset: List[Dict]) -> bool:
-        """Check if optimization is needed"""
         if len(dataset) < MIN_DATA_FOR_PREDICTION:
             return False
-        
-        # Optimize every MAINTENANCE_INTERVAL records
         if len(dataset) - self.last_maintenance >= MAINTENANCE_INTERVAL:
             self.last_maintenance = len(dataset)
             return True
-        
-        # Force optimization if approaching limits
         if len(dataset) >= CLEANUP_THRESHOLD:
             return True
-        
         return False
 
-# ═══════════════════════ Real-time Analytics ═══════════════════════
+# ═══════════════════════ Analytics ═══════════════════════
 
 class Analytics:
-    """Track real-time performance and statistics"""
-    
     def __init__(self):
         self.prediction_history = deque(maxlen=HISTORY_SIZE)
-        self.pattern_stats = defaultdict(lambda: {'total': 0, 'errors': []})
-    
+
     def track_prediction(self, predicted: int, actual: int, pattern_key: str, direction: str):
-        """Track prediction accuracy"""
-        error = calculate_pocket_distance(predicted, actual, direction)
-        
-        # Normalize to shortest distance
-        if error > 18:
-            error = 37 - error
-        
-        self.prediction_history.append({
-            'predicted': predicted,
-            'actual': actual,
-            'error': error,
-            'timestamp': time.time()
-        })
-        
-        self.pattern_stats[pattern_key]['total'] += 1
-        self.pattern_stats[pattern_key]['errors'].append(error)
-        
-        return error
-    
+        err = calculate_pocket_distance(predicted, actual, direction)
+        if err > 18:
+            err = 37 - err
+        self.prediction_history.append({'predicted': predicted, 'actual': actual, 'error': err, 'ts': time.time()})
+        return err
+
     def get_statistics(self) -> Dict[str, Any]:
-        """Get current performance statistics"""
         if not self.prediction_history:
-            return {
-                'average_error': 'N/A',
-                'success_rate_3': 'N/A',
-                'success_rate_5': 'N/A',
-                'trend': 'collecting'
-            }
-        
+            return {'average_error': 'N/A', 'success_rate_3': 'N/A', 'success_rate_5': 'N/A', 'trend': 'collecting'}
         recent = list(self.prediction_history)
         errors = [p['error'] for p in recent]
-        
-        # Calculate trend
         if len(errors) >= 20:
-            first_half = errors[:len(errors)//2]
-            second_half = errors[len(errors)//2:]
-            trend = 'improving' if mean(second_half) < mean(first_half) else 'stable'
+            first, second = errors[:len(errors)//2], errors[len(errors)//2:]
+            trend = 'improving' if sum(second)/len(second) < sum(first)/len(first) else 'stable'
         else:
             trend = 'collecting'
-        
+        def sr(k): 
+            return round(100.0 * sum(1 for e in errors if e <= k) / len(errors), 1)
+        from statistics import mean, median
         return {
             'average_error': round(mean(errors), 1),
             'median_error': round(median(errors), 1),
-            'success_rate_3': round(len([e for e in errors if e <= 3]) / len(errors) * 100, 1),
-            'success_rate_5': round(len([e for e in errors if e <= 5]) / len(errors) * 100, 1),
+            'success_rate_3': sr(3),
+            'success_rate_5': sr(5),
             'best': min(errors),
             'worst': max(errors),
             'trend': trend,
-            'total_predictions': len(self.prediction_history)
+            'total_predictions': len(errors)
         }
 
-# ═══════════════════════ Main Prediction System ═══════════════════════
+# ═══════════════════════ Main System ═══════════════════════
 
 class PredictionSystem:
-    """Main prediction system orchestrator"""
-    
     def __init__(self):
         self.storage = DataStorage()
         self.pattern_engine = PatternEngine()
         self.quality_manager = QualityManager()
         self.analytics = Analytics()
-        
-        # Rebuild pattern cache
         self.pattern_engine.rebuild_cache(self.storage.active_dataset)
-        
-        # Track pending predictions
         self.pending_predictions = {}
-    
-    def predict(self, request: PredictionRequest) -> Dict[str, Any]:
-        # Reject too-fast measurements (client may also filter, this is a second safety rail)
+
+    def predict(self, request: 'PredictionRequest') -> Dict[str, Any]:
         if request.ball_speed_ms < MIN_BALL_SPEED_MS:
             return {
                 'predicted_number': None,
@@ -472,14 +397,10 @@ class PredictionSystem:
                 'accuracy': self.analytics.get_statistics(),
                 'data_quality': '0%'
             }
-        """Generate prediction"""
-        
-        # Handle pending data
+        # handle pending
         if self.storage.pending_round and self.storage.pending_round['round_id'] != request.round_id:
-            logger.warning(f"Dropping incomplete round {self.storage.pending_round['round_id']} - no winner received")
             self.storage.pending_round = None
-        
-        # Store new pending round
+        # store pending
         self.storage.pending_round = {
             'round_id': request.round_id,
             'ball_speed_ms': request.ball_speed_ms,
@@ -491,10 +412,7 @@ class PredictionSystem:
             'timestamp1_position_y': request.timestamp1_position.get('y') if request.timestamp1_position else None,
             'timestamp': time.time()
         }
-        
-        # Check if we have enough data
         dataset_size = len(self.storage.active_dataset)
-        
         if dataset_size < MIN_DATA_FOR_PREDICTION:
             return {
                 'predicted_number': None,
@@ -503,14 +421,9 @@ class PredictionSystem:
                 'accuracy': {'error_margin': 'N/A', 'success_rate_3': 'N/A'},
                 'data_quality': '0%'
             }
-        
-        # Find matching patterns
         matches, confidence = self.pattern_engine.find_matches(
-            request.ball_speed_ms,
-            request.traveled_pockets,
-            request.ball_direction
+            request.ball_speed_ms, request.traveled_pockets, request.ball_direction
         )
-        
         if not matches or confidence < MIN_PATTERN_CONFIDENCE:
             return {
                 'predicted_number': None,
@@ -519,25 +432,14 @@ class PredictionSystem:
                 'accuracy': self.analytics.get_statistics(),
                 'data_quality': f'{int(confidence * 100)}%'
             }
-        
-        # Calculate prediction
         offset = self.pattern_engine.predict_offset(matches)
-        predicted_number = get_number_at_offset(
-            request.timestamp2_number,
-            offset,
-            request.ball_direction
-        )
-        
-        # Store prediction for validation
+        predicted_number = get_number_at_offset(request.timestamp2_number, offset, request.ball_direction)
         self.pending_predictions[request.round_id] = {
             'predicted': predicted_number,
             'pattern_matches': len(matches),
             'confidence': confidence
         }
-        
-        # Get statistics
         stats = self.analytics.get_statistics()
-        
         return {
             'predicted_number': predicted_number,
             'dataset_rows': dataset_size,
@@ -549,42 +451,23 @@ class PredictionSystem:
             'data_quality': f'{int(confidence * 100)}%',
             'confidence': round(confidence, 2)
         }
-    
+
     def log_winner(self, round_id: str, winning_number: int) -> Dict[str, Any]:
-        """Log winning number and complete round data"""
-        
-        # Check for pending round
         if not self.storage.pending_round or self.storage.pending_round['round_id'] != round_id:
-            return {
-                'ok': False,
-                'error': 'No pending data for this round'
-            }
-        
-        # Get pending data
+            return {'ok': False, 'error': 'No pending data for this round'}
         pending = self.storage.pending_round
-        
-        # Calculate pockets to winner
         pockets_to_winner = calculate_pocket_distance(
-            pending['timestamp2_number'],
-            winning_number,
-            pending['ball_direction']
+            pending['timestamp2_number'], winning_number, pending['ball_direction']
         )
-        
-        # Get prediction if exists
         prediction_data = self.pending_predictions.pop(round_id, None)
         predicted_number = prediction_data['predicted'] if prediction_data else None
-        
-        # Calculate error if we made a prediction
         prediction_error = None
         if predicted_number is not None:
             prediction_error = self.analytics.track_prediction(
-                predicted_number,
-                winning_number,
+                predicted_number, winning_number,
                 f"{pending['ball_speed_ms']//50}_{pending['traveled_pockets']}_{pending['ball_direction']}",
                 pending['ball_direction']
             )
-        
-        # Create complete record
         record = {
             'timestamp': datetime.now().isoformat(),
             'round_id': round_id,
@@ -601,33 +484,17 @@ class PredictionSystem:
             'prediction_error': prediction_error if prediction_error is not None else '',
             'confidence': prediction_data['confidence'] if prediction_data else ''
         }
-        
-        # Save to dataset
         self.storage.save_record(record)
-        # NEW: Rebuild pattern cache immediately so the next prediction uses this record
         self.pattern_engine.rebuild_cache(self.storage.active_dataset)
-        
-        # Clear pending
         self.storage.pending_round = None
-        
-        # Check if optimization needed
         if self.quality_manager.should_optimize(self.storage.active_dataset):
-            logger.info("Running dataset optimization...")
-            self.storage.active_dataset = self.quality_manager.optimize_dataset(
-                self.storage.active_dataset
-            )
+            self.storage.active_dataset = self.quality_manager.optimize_dataset(self.storage.active_dataset)
             self.storage.rewrite_dataset()
             self.pattern_engine.rebuild_cache(self.storage.active_dataset)
-        
-        # Get updated stats
         stats = self.analytics.get_statistics()
-        
         return {
-            'ok': True,
-            'stored': True,
-            'dataset_rows': len(self.storage.active_dataset),
-            'winning_number': winning_number,
-            'predicted_number': predicted_number,
+            'ok': True, 'stored': True, 'dataset_rows': len(self.storage.active_dataset),
+            'winning_number': winning_number, 'predicted_number': predicted_number,
             'error': prediction_error if prediction_error is not None else 'N/A',
             'current_accuracy': {
                 'average_error': stats['average_error'],
@@ -635,11 +502,11 @@ class PredictionSystem:
             }
         }
 
-# ═══════════════════════ FastAPI Application ═══════════════════════
+# ═══════════════════════ FastAPI App ═══════════════════════
 
 app = FastAPI(
-    title="Roulette Prediction Server v17 Professional",
-    description="Advanced pattern matching with intelligent data management",
+    title="Roulette Prediction Server v18 Professional",
+    description="Advanced pattern matching with circular statistics",
     version="1.0"
 )
 
@@ -651,16 +518,13 @@ app.add_middleware(
     allow_credentials=True
 )
 
-# Initialize prediction system
 predictor = PredictionSystem()
 
 @app.on_event("startup")
 async def startup():
-    """Initialize server on startup"""
     stats = predictor.analytics.get_statistics()
-    
     logger.info("="*70)
-    logger.info("ROULETTE PREDICTION SERVER V17 PROFESSIONAL")
+    logger.info("ROULETTE PREDICTION SERVER V18 PROFESSIONAL")
     logger.info("="*70)
     logger.info(f"Data path: {DATA_PATH}")
     logger.info(f"Dataset size: {len(predictor.storage.active_dataset)}")
@@ -670,12 +534,10 @@ async def startup():
 
 @app.get("/")
 async def root():
-    """Server status and statistics"""
     stats = predictor.analytics.get_statistics()
     dataset_size = len(predictor.storage.active_dataset)
-    
     return {
-        "server": "Roulette Prediction Server v17 Professional",
+        "server": "Roulette Prediction Server v18 Professional",
         "status": "operational",
         "statistics": stats,
         "dataset": {
@@ -689,57 +551,39 @@ async def root():
 
 @app.post("/predict")
 async def predict(request: PredictionRequest):
-    """Generate prediction endpoint"""
     try:
         result = predictor.predict(request)
-        
         if result.get('predicted_number'):
             logger.info(f"Prediction: {result['predicted_number']} "
-                       f"(confidence: {result.get('confidence', 'N/A')}, "
-                       f"quality: {result.get('data_quality', 'N/A')})")
-        
+                        f"(confidence: {result.get('confidence','N/A')}, "
+                        f"quality: {result.get('data_quality','N/A')})")
         return result
-        
     except Exception as e:
         logger.error(f"Prediction error: {e}")
-        return {
-            "predicted_number": None,
-            "error": str(e)
-        }
+        return {"predicted_number": None, "error": str(e)}
 
 @app.post("/log_winner")
 async def log_winner(request: LogWinnerRequest):
-    """Log winning number endpoint"""
     try:
         result = predictor.log_winner(request.round_id, request.winning_number)
-        
         if result.get('stored'):
             logger.info(f"Winner logged: {request.winning_number}, "
-                       f"Predicted: {result.get('predicted_number', 'N/A')}, "
-                       f"Error: {result.get('error', 'N/A')}")
-        
+                        f"Predicted: {result.get('predicted_number','N/A')}, "
+                        f"Error: {result.get('error','N/A')}")
         return result
-        
     except Exception as e:
         logger.error(f"Error logging winner: {e}")
-        return {
-            "ok": False,
-            "error": str(e)
-        }
+        return {"ok": False, "error": str(e)}
 
 @app.get("/statistics")
 async def get_statistics():
-    """Detailed statistics endpoint"""
     stats = predictor.analytics.get_statistics()
     dataset = predictor.storage.active_dataset
-    
-    # Pattern analysis
     pattern_distribution = defaultdict(int)
-    for record in dataset:
-        if 'ball_speed_ms' in record and 'traveled_pockets' in record:
-            key = f"{record['ball_speed_ms']//100}00ms_{record['traveled_pockets']}pockets"
+    for r in dataset:
+        if 'ball_speed_ms' in r and 'traveled_pockets' in r:
+            key = f"{r['ball_speed_ms']//100}00ms_{r['traveled_pockets']}pockets"
             pattern_distribution[key] += 1
-    
     return {
         "performance": stats,
         "dataset_size": len(dataset),
@@ -750,24 +594,21 @@ async def get_statistics():
 
 @app.delete("/clear_pending")
 async def clear_pending():
-    """Clear all pending predictions"""
     predictor.storage.pending_round = None
     predictor.pending_predictions.clear()
     return {"status": "cleared"}
 
 if __name__ == "__main__":
     import uvicorn
-    
     print("\n" + "="*70)
-    print("ROULETTE PREDICTION SERVER V17 PROFESSIONAL")
+    print("ROULETTE PREDICTION SERVER V18 PROFESSIONAL")
     print("="*70)
     print("Features:")
     print("  • Two-phase data collection (predict → log_winner)")
-    print("  • Intelligent pattern matching with confidence scoring")
+    print("  • Circular-std based confidence with expanded speed buckets")
     print("  • Automatic quality optimization")
     print("  • Real-time performance tracking")
     print("  • Adaptive dataset management")
     print(f"Data storage: {DATA_PATH}")
     print("="*70 + "\n")
-    
     uvicorn.run(app, host="0.0.0.0", port=8000)
