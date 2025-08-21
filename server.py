@@ -32,6 +32,9 @@ OPTIMAL_DATA_SIZE = 1500        # Target for good accuracy
 MAX_DATASET_SIZE = 3000         # Maximum records to keep
 CLEANUP_THRESHOLD = 2500        # Start cleanup when reaching this
 
+
+# Speed gate: ignore spins that are too fast/unstable for T1→T2 (ms)
+MIN_BALL_SPEED_MS = 450  # below this, ignore for prediction & dataset
 # Matching parameters
 SPEED_TOLERANCE_MS = 50         # ±50ms for speed matching
 POSITION_TOLERANCE_PX = 30      # ±30px for position matching
@@ -47,6 +50,15 @@ PATTERN_MIN_SAMPLES = 5         # Minimum samples to evaluate pattern
 HISTORY_SIZE = 100              # Size of prediction history
 
 # CSV Configuration
+# --- Runtime overrides via environment variables (optional) ---
+MIN_DATA_FOR_PREDICTION = int(os.getenv("MIN_DATA_FOR_PREDICTION", MIN_DATA_FOR_PREDICTION))
+OPTIMAL_DATA_SIZE = int(os.getenv("OPTIMAL_DATA_SIZE", OPTIMAL_DATA_SIZE))
+MAX_DATASET_SIZE = int(os.getenv("MAX_DATASET_SIZE", MAX_DATASET_SIZE))
+CLEANUP_THRESHOLD = int(os.getenv("CLEANUP_THRESHOLD", CLEANUP_THRESHOLD))
+MIN_BALL_SPEED_MS = int(os.getenv("MIN_BALL_SPEED_MS", MIN_BALL_SPEED_MS))
+SPEED_TOLERANCE_MS = int(os.getenv("SPEED_TOLERANCE_MS", SPEED_TOLERANCE_MS))
+MIN_PATTERN_CONFIDENCE = float(os.getenv("MIN_PATTERN_CONFIDENCE", MIN_PATTERN_CONFIDENCE))
+
 CSV_COLUMNS = [
     'timestamp', 'round_id', 'ball_speed_ms', 'traveled_pockets',
     'pockets_to_winner', 'ball_direction',
@@ -450,6 +462,16 @@ class PredictionSystem:
         self.pending_predictions = {}
     
     def predict(self, request: PredictionRequest) -> Dict[str, Any]:
+        # Reject too-fast measurements (client may also filter, this is a second safety rail)
+        if request.ball_speed_ms < MIN_BALL_SPEED_MS:
+            return {
+                'predicted_number': None,
+                'dataset_rows': len(self.storage.active_dataset),
+                'ignored': True,
+                'reason': f'CRITICAL_SPEED_< {MIN_BALL_SPEED_MS}ms',
+                'accuracy': self.analytics.get_statistics(),
+                'data_quality': '0%'
+            }
         """Generate prediction"""
         
         # Handle pending data
@@ -582,6 +604,8 @@ class PredictionSystem:
         
         # Save to dataset
         self.storage.save_record(record)
+        # NEW: Rebuild pattern cache immediately so the next prediction uses this record
+        self.pattern_engine.rebuild_cache(self.storage.active_dataset)
         
         # Clear pending
         self.storage.pending_round = None
