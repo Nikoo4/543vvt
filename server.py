@@ -11,7 +11,6 @@ import logging
 from datetime import datetime
 from collections import defaultdict, deque
 from typing import List, Dict, Any, Optional, Tuple
-from statistics import median
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
@@ -50,21 +49,29 @@ CSV_COLUMNS = [
 def get_data_path() -> str:
     """Get data file path for CSV storage"""
     candidates = [
+        os.getenv("ROULETTE_DATA_PATH", ""),
         os.path.join(os.path.expanduser("~"), ".roulette_data", "dataset.csv"),
         os.path.join("/tmp", "roulette_dataset.csv"),
         os.path.join(".", "roulette_dataset.csv")
     ]
     
     for path in candidates:
+        if not path:
+            continue
         try:
             directory = os.path.dirname(path)
             if directory and not os.path.exists(directory):
                 os.makedirs(directory, exist_ok=True)
             
+            # Test write access
+            with open(path, 'a', encoding='utf-8') as f:
+                pass
+            
             # Initialize CSV if needed
             if not os.path.exists(path) or os.path.getsize(path) == 0:
                 with open(path, 'w', newline='', encoding='utf-8') as f:
-                    writer = csv.writer(f)
+                    import csv as _csv
+                    writer = _csv.writer(f)
                     writer.writerow(CSV_COLUMNS)
             
             logger.info(f"Using data path: {path}")
