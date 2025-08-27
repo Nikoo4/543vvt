@@ -36,8 +36,8 @@ logger = logging.getLogger("RouletteServer")
 class Config:
     """Server configuration parameters"""
     # Grid cell sizes for pattern matching
-    POSITION_CELL_SIZE = 10  # pixels
-    SPEED_CELL_SIZE = 20     # milliseconds
+    POSITION_CELL_SIZE = 5  # pixels
+    SPEED_CELL_SIZE = 10     # milliseconds
     
     # Data management
     MAX_RECORDS_PER_CELL = 100
@@ -46,10 +46,10 @@ class Config:
     
     # Search parameters
     MAX_SEARCH_RADIUS = 3
-    MIN_MATCHES_FOR_PREDICTION = 3
+    MIN_MATCHES_FOR_PREDICTION = 5
     
     # Validation
-    MIN_BALL_SPEED_MS = 450
+    MIN_BALL_SPEED_MS = 400
     MAX_BALL_SPEED_MS = 3000
     VALID_DIRECTIONS = ['CW', 'CCW']
     
