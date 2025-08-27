@@ -1,6 +1,6 @@
 """
-Roulette Prediction Server - Pure v17 Implementation
-Pattern matching system for roulette ball tracking and outcome prediction
+Professional Roulette Prediction Server
+High-accuracy pattern matching system for Evolution Gaming roulette
 """
 
 import os
@@ -8,345 +8,501 @@ import csv
 import json
 import time
 import logging
-from datetime import datetime
+import hashlib
+from datetime import datetime, timedelta
 from collections import defaultdict, deque
 from typing import List, Dict, Any, Optional, Tuple
+from enum import Enum
 
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
+from pydantic import BaseModel, Field, validator
 
+# Configure professional logging
 logging.basicConfig(
     level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+    format='%(asctime)s | %(name)s | %(levelname)s | %(message)s',
+    handlers=[
+        logging.FileHandler('roulette_server.log'),
+        logging.StreamHandler()
+    ]
 )
-logger = logging.getLogger("RoulettePredictionServer")
+logger = logging.getLogger("RouletteServer")
 
-# Configuration
-CELL_SIZE_X = 10  # Position grid size in pixels
-CELL_SIZE_Y = 10
-CELL_SIZE_SPEED = 20  # Speed grid size in ms
-MAX_RECORDS_PER_CELL = 50  # Maximum records to keep per cell
-GLOBAL_MAX_RECORDS = 100000  # Global dataset limit
-SEARCH_RADIUS_LIMIT = 3  # Maximum expansion radius for neighbor search
+# ============================================================================
+# CONFIGURATION
+# ============================================================================
 
-# European wheel layout (clockwise)
-EUROPEAN_WHEEL = [
-    0, 32, 15, 19, 4, 21, 2, 25, 17, 34, 6, 27,
-    13, 36, 11, 30, 8, 23, 10, 5, 24, 16, 33, 1,
-    20, 14, 31, 9, 22, 18, 29, 7, 28, 12, 35, 3, 26
-]
-POCKET_INDICES = {num: i for i, num in enumerate(EUROPEAN_WHEEL)}
-
-# CSV columns for dataset storage
-CSV_COLUMNS = [
-    'timestamp', 'round_id', 'table_id',
-    'pos_x', 'pos_y', 'speed_ms_total', 'traveled_pockets',
-    'direction', 'number_at_t1', 'number_at_t2', 
-    'winning_number', 'offset_to_winner'
-]
-
-def get_data_path() -> str:
-    """Get data file path for CSV storage"""
-    candidates = [
-        os.getenv("ROULETTE_DATA_PATH", ""),
-        os.path.join(os.path.expanduser("~"), ".roulette_data", "dataset.csv"),
-        os.path.join("/tmp", "roulette_dataset.csv"),
-        os.path.join(".", "roulette_dataset.csv")
+class Config:
+    """Server configuration parameters"""
+    # Grid cell sizes for pattern matching
+    POSITION_CELL_SIZE = 10  # pixels
+    SPEED_CELL_SIZE = 20     # milliseconds
+    
+    # Data management
+    MAX_RECORDS_PER_CELL = 100
+    GLOBAL_MAX_RECORDS = 500000
+    PENDING_TIMEOUT_MINUTES = 10
+    
+    # Search parameters
+    MAX_SEARCH_RADIUS = 3
+    MIN_MATCHES_FOR_PREDICTION = 3
+    
+    # Validation
+    MIN_BALL_SPEED_MS = 450
+    MAX_BALL_SPEED_MS = 3000
+    VALID_DIRECTIONS = ['CW', 'CCW']
+    
+    # European wheel layout (single zero, clockwise order)
+    WHEEL_LAYOUT = [
+        0, 32, 15, 19, 4, 21, 2, 25, 17, 34, 6, 27,
+        13, 36, 11, 30, 8, 23, 10, 5, 24, 16, 33, 1,
+        20, 14, 31, 9, 22, 18, 29, 7, 28, 12, 35, 3, 26
     ]
     
-    for path in candidates:
-        if not path:
-            continue
-        try:
-            directory = os.path.dirname(path)
-            if directory and not os.path.exists(directory):
-                os.makedirs(directory, exist_ok=True)
-            
-            # Test write access
-            with open(path, 'a', encoding='utf-8') as f:
-                pass
-            
-            # Initialize CSV if needed
-            if not os.path.exists(path) or os.path.getsize(path) == 0:
-                with open(path, 'w', newline='', encoding='utf-8') as f:
-                    import csv as _csv
-                    writer = _csv.writer(f)
-                    writer.writerow(CSV_COLUMNS)
-            
-            logger.info(f"Using data path: {path}")
-            return path
-        except Exception as e:
-            logger.warning(f"Cannot use path {path}: {e}")
+    # Create reverse lookup
+    POCKET_TO_INDEX = {num: idx for idx, num in enumerate(WHEEL_LAYOUT)}
     
-    raise RuntimeError("No writable location found for dataset")
+    # CSV structure
+    CSV_COLUMNS = [
+        'timestamp', 'round_id', 'table_id',
+        'pos_x', 'pos_y', 'speed_ms', 'traveled_pockets',
+        'direction', 'number_t1', 'number_t2', 
+        'winning_number', 'offset_from_t2'
+    ]
 
-DATA_PATH = get_data_path()
-
-def calculate_pocket_offset(from_number: int, to_number: int, direction: str) -> int:
-    """Calculate pocket offset between two numbers in given direction"""
-    from_idx = POCKET_INDICES[from_number]
-    to_idx = POCKET_INDICES[to_number]
-    
-    if direction == "CW":
-        offset = (to_idx - from_idx) % 37
-    else:  # CCW
-        offset = (from_idx - to_idx) % 37
-    
-    # Normalize to -18..18 range
-    if offset > 18:
-        offset = offset - 37
-    
-    return offset
-
-def get_number_at_offset(from_number: int, offset: int, direction: str) -> int:
-    """Get pocket number at given offset from reference number"""
-    from_idx = POCKET_INDICES[from_number]
-    
-    if direction == "CW":
-        target_idx = (from_idx + offset) % 37
-    else:  # CCW
-        target_idx = (from_idx - offset) % 37
-    
-    return EUROPEAN_WHEEL[target_idx]
-
-def round_to_cell(x: float, y: float, speed: int) -> Tuple[int, int, int]:
-    """Round position and speed to cell coordinates"""
-    x_cell = int(round(x / CELL_SIZE_X) * CELL_SIZE_X)
-    y_cell = int(round(y / CELL_SIZE_Y) * CELL_SIZE_Y)
-    speed_cell = int(round(speed / CELL_SIZE_SPEED) * CELL_SIZE_SPEED)
-    return (x_cell, y_cell, speed_cell)
+# ============================================================================
+# DATA MODELS
+# ============================================================================
 
 class PredictionRequest(BaseModel):
-    """Request model for prediction endpoint"""
-    round_id: str
-    pos_x: float
-    pos_y: float
-    speed_ms_total: int
-    traveled_pockets: int = 7
-    direction: str
-    number_at_t1: int
-    number_at_t2: int
-    table_id: Optional[str] = "default"
+    """Incoming prediction request from client"""
+    round_id: str = Field(..., min_length=5, max_length=50)
+    pos_x: float = Field(..., ge=0, le=2000)
+    pos_y: float = Field(..., ge=0, le=2000)
+    speed_ms_total: int = Field(..., ge=100, le=5000)
+    traveled_pockets: int = Field(default=7, ge=1, le=37)
+    direction: str = Field(..., regex="^(CW|CCW)$")
+    number_at_t1: int = Field(..., ge=0, le=36)
+    number_at_t2: int = Field(..., ge=0, le=36)
+    table_id: str = Field(default="default", max_length=50)
+    direction_confidence: Optional[float] = Field(default=None, ge=0, le=1)
+    
+    @validator('speed_ms_total')
+    def validate_speed(cls, v):
+        if v < Config.MIN_BALL_SPEED_MS:
+            raise ValueError(f"Speed {v}ms below minimum {Config.MIN_BALL_SPEED_MS}ms")
+        return v
 
-class LogWinnerRequest(BaseModel):
-    """Request model for logging winner endpoint"""
-    round_id: str
-    winning_number: int
+class WinnerRequest(BaseModel):
+    """Winning number notification from client"""
+    round_id: str = Field(..., min_length=5, max_length=50)
+    winning_number: int = Field(..., ge=0, le=36)
+
+# ============================================================================
+# CORE FUNCTIONS
+# ============================================================================
+
+class WheelPhysics:
+    """Handle roulette wheel physics and calculations"""
+    
+    @staticmethod
+    def calculate_pocket_distance(from_number: int, to_number: int, direction: str) -> int:
+        """
+        Calculate pocket distance between two numbers in given direction
+        Returns positive value for forward movement, negative for backward
+        """
+        from_idx = Config.POCKET_TO_INDEX.get(from_number)
+        to_idx = Config.POCKET_TO_INDEX.get(to_number)
+        
+        if from_idx is None or to_idx is None:
+            raise ValueError(f"Invalid pocket numbers: {from_number}, {to_number}")
+        
+        if direction == "CW":
+            # Clockwise: calculate forward distance
+            distance = (to_idx - from_idx) % 37
+        else:  # CCW
+            # Counter-clockwise: calculate backward distance
+            distance = (from_idx - to_idx) % 37
+        
+        # Normalize to -18 to +18 range (shortest path)
+        if distance > 18:
+            distance = distance - 37
+            
+        return distance
+    
+    @staticmethod
+    def get_number_at_distance(from_number: int, distance: int, direction: str) -> int:
+        """Get pocket number at specified distance from reference"""
+        from_idx = Config.POCKET_TO_INDEX.get(from_number)
+        
+        if from_idx is None:
+            raise ValueError(f"Invalid pocket number: {from_number}")
+        
+        if direction == "CW":
+            target_idx = (from_idx + distance) % 37
+        else:  # CCW
+            target_idx = (from_idx - distance) % 37
+            
+        return Config.WHEEL_LAYOUT[target_idx]
+
+class GridSystem:
+    """Grid-based indexing for pattern matching"""
+    
+    @staticmethod
+    def get_cell_key(x: float, y: float, speed: int, direction: str) -> Tuple:
+        """Convert position and speed to grid cell coordinates"""
+        x_cell = round(x / Config.POSITION_CELL_SIZE) * Config.POSITION_CELL_SIZE
+        y_cell = round(y / Config.POSITION_CELL_SIZE) * Config.POSITION_CELL_SIZE
+        speed_cell = round(speed / Config.SPEED_CELL_SIZE) * Config.SPEED_CELL_SIZE
+        return (x_cell, y_cell, speed_cell, direction)
+
+# ============================================================================
+# DATA STORAGE
+# ============================================================================
 
 class DataStorage:
-    """Handles dataset storage and retrieval using cell-based indexing"""
+    """Professional data storage and pattern matching system"""
     
     def __init__(self):
-        self.cells = defaultdict(list)  # Cell -> list of records
-        self.pending_rounds = {}  # round_id -> partial data
+        self.data_path = self._get_data_path()
+        self.pending_rounds = {}  # Temporary storage for incomplete rounds
+        self.pattern_database = defaultdict(list)  # Grid cells with historical data
         self.total_records = 0
-        self.load_dataset()
-    
-    def load_dataset(self):
-        """Load existing dataset from CSV"""
-        if not os.path.exists(DATA_PATH):
-            return
+        self.predictions_made = {}  # Track predictions for accuracy analysis
         
+        self._initialize_storage()
+        self._load_existing_data()
+        
+    def _get_data_path(self) -> str:
+        """Determine optimal data storage location"""
+        candidates = [
+            os.getenv("ROULETTE_DATA_PATH", ""),
+            os.path.expanduser("~/.roulette_server/database.csv"),
+            "/var/lib/roulette/database.csv",
+            "./roulette_database.csv"
+        ]
+        
+        for path in candidates:
+            if not path:
+                continue
+            try:
+                directory = os.path.dirname(path)
+                if directory:
+                    os.makedirs(directory, exist_ok=True)
+                
+                # Test write permissions
+                with open(path, 'a', encoding='utf-8'):
+                    pass
+                
+                logger.info(f"Using data storage: {path}")
+                return path
+            except Exception as e:
+                continue
+                
+        raise RuntimeError("No writable location found for database")
+    
+    def _initialize_storage(self):
+        """Initialize CSV file with headers if needed"""
+        if not os.path.exists(self.data_path) or os.path.getsize(self.data_path) == 0:
+            with open(self.data_path, 'w', newline='', encoding='utf-8') as f:
+                writer = csv.DictWriter(f, fieldnames=Config.CSV_COLUMNS)
+                writer.writeheader()
+            logger.info("Initialized new database")
+    
+    def _load_existing_data(self):
+        """Load historical data into memory for pattern matching"""
+        if not os.path.exists(self.data_path):
+            return
+            
         try:
-            with open(DATA_PATH, 'r', encoding='utf-8') as f:
+            with open(self.data_path, 'r', encoding='utf-8') as f:
                 reader = csv.DictReader(f)
+                loaded = 0
+                
                 for row in reader:
-                    # Skip incomplete records
-                    if not row.get('offset_to_winner'):
+                    # Validate row data
+                    if not all(k in row for k in ['pos_x', 'pos_y', 'speed_ms', 'direction', 'offset_from_t2']):
                         continue
                     
-                    # Parse numeric fields
                     try:
+                        # Parse and validate
                         x = float(row['pos_x'])
                         y = float(row['pos_y'])
-                        speed = int(row['speed_ms_total'])
+                        speed = int(row['speed_ms'])
                         direction = row['direction']
                         
-                        # Skip invalid directions
-                        if direction not in ['CW', 'CCW']:
+                        if direction not in Config.VALID_DIRECTIONS:
                             continue
                         
-                        # Add to cell
-                        cell_key = (*round_to_cell(x, y, speed), direction)
-                        self.cells[cell_key].append(row)
-                        self.total_records += 1
-                    except (ValueError, KeyError):
+                        # Add to grid cell
+                        cell_key = GridSystem.get_cell_key(x, y, speed, direction)
+                        
+                        # Keep only essential data in memory
+                        pattern_data = {
+                            'offset': int(row['offset_from_t2']),
+                            'timestamp': row['timestamp'],
+                            'confidence': float(row.get('confidence', 1.0))
+                        }
+                        
+                        self.pattern_database[cell_key].append(pattern_data)
+                        loaded += 1
+                        
+                        # Enforce cell limit
+                        if len(self.pattern_database[cell_key]) > Config.MAX_RECORDS_PER_CELL:
+                            self.pattern_database[cell_key] = self.pattern_database[cell_key][-Config.MAX_RECORDS_PER_CELL:]
+                    
+                    except (ValueError, KeyError) as e:
                         continue
-            
-            logger.info(f"Loaded {self.total_records} valid records into {len(self.cells)} cells")
+                
+                self.total_records = loaded
+                logger.info(f"Loaded {loaded} historical records into {len(self.pattern_database)} grid cells")
+                
         except Exception as e:
-            logger.error(f"Error loading dataset: {e}")
+            logger.error(f"Error loading database: {e}")
     
-    def save_pending(self, request: PredictionRequest):
-        """Save pending round data (before winner is known)"""
-        self.pending_rounds[request.round_id] = {
-            'timestamp': datetime.now().isoformat(),
-            'round_id': request.round_id,
-            'table_id': request.table_id or 'default',
-            'pos_x': request.pos_x,
-            'pos_y': request.pos_y,
-            'speed_ms_total': request.speed_ms_total,
-            'traveled_pockets': request.traveled_pockets,
-            'direction': request.direction,
-            'number_at_t1': request.number_at_t1,
-            'number_at_t2': request.number_at_t2
-        }
-    
-    def finalize_round(self, round_id: str, winning_number: int) -> bool:
-        """Complete round data with winner and save to dataset"""
-        if round_id not in self.pending_rounds:
+    def store_pending(self, request: PredictionRequest) -> bool:
+        """Store round data temporarily until winning number arrives"""
+        # Clean expired pending rounds
+        self._cleanup_expired_pending()
+        
+        # Validate direction
+        if request.direction not in Config.VALID_DIRECTIONS:
+            logger.warning(f"Invalid direction {request.direction} - rejecting round {request.round_id}")
             return False
         
-        data = self.pending_rounds[round_id]
+        # Store pending data
+        self.pending_rounds[request.round_id] = {
+            'timestamp': datetime.now(),
+            'data': request.dict(),
+            'prediction': None
+        }
         
-        # Calculate offset
-        offset = calculate_pocket_offset(
-            data['number_at_t2'],
-            winning_number,
-            data['direction']
-        )
-        
-        # Complete record
-        data['winning_number'] = winning_number
-        data['offset_to_winner'] = offset
-        
-        # Add to cell
-        cell_key = (
-            *round_to_cell(data['pos_x'], data['pos_y'], data['speed_ms_total']),
-            data['direction']
-        )
-        
-        # Enforce cell limit
-        if len(self.cells[cell_key]) >= MAX_RECORDS_PER_CELL:
-            # Keep only most recent records
-            self.cells[cell_key] = self.cells[cell_key][-(MAX_RECORDS_PER_CELL-1):]
-        
-        self.cells[cell_key].append(data)
-        self.total_records += 1
-        
-        # Save to CSV
-        try:
-            with open(DATA_PATH, 'a', newline='', encoding='utf-8') as f:
-                writer = csv.DictWriter(f, fieldnames=CSV_COLUMNS)
-                writer.writerow(data)
-        except Exception as e:
-            logger.error(f"Error saving to CSV: {e}")
-        
-        # Clean up pending
-        del self.pending_rounds[round_id]
-        
-        # Global limit enforcement
-        if self.total_records > GLOBAL_MAX_RECORDS:
-            self._cleanup_old_records()
-        
+        logger.info(f"Stored pending round {request.round_id}, direction: {request.direction}, speed: {request.speed_ms_total}ms")
         return True
     
-    def _cleanup_old_records(self):
-        """Remove oldest records when global limit exceeded"""
-        # Simple strategy: remove oldest 10% of records
-        target_remove = self.total_records // 10
-        removed = 0
+    def finalize_round(self, round_id: str, winning_number: int) -> Dict[str, Any]:
+        """Complete round with winning number and store in database"""
+        if round_id not in self.pending_rounds:
+            return {
+                "success": False,
+                "error": "Round not found in pending storage"
+            }
         
-        for cell_key in list(self.cells.keys()):
-            if removed >= target_remove:
-                break
+        pending = self.pending_rounds[round_id]
+        round_data = pending['data']
+        
+        # Calculate offset from T2 to winning number
+        offset = WheelPhysics.calculate_pocket_distance(
+            round_data['number_at_t2'],
+            winning_number,
+            round_data['direction']
+        )
+        
+        # Prepare complete record
+        complete_record = {
+            'timestamp': pending['timestamp'].isoformat(),
+            'round_id': round_id,
+            'table_id': round_data['table_id'],
+            'pos_x': round_data['pos_x'],
+            'pos_y': round_data['pos_y'],
+            'speed_ms': round_data['speed_ms_total'],
+            'traveled_pockets': round_data['traveled_pockets'],
+            'direction': round_data['direction'],
+            'number_t1': round_data['number_at_t1'],
+            'number_t2': round_data['number_at_t2'],
+            'winning_number': winning_number,
+            'offset_from_t2': offset
+        }
+        
+        # Save to database
+        self._save_to_csv(complete_record)
+        
+        # Add to pattern database
+        cell_key = GridSystem.get_cell_key(
+            round_data['pos_x'],
+            round_data['pos_y'],
+            round_data['speed_ms_total'],
+            round_data['direction']
+        )
+        
+        pattern_data = {
+            'offset': offset,
+            'timestamp': complete_record['timestamp'],
+            'confidence': round_data.get('direction_confidence', 1.0)
+        }
+        
+        self.pattern_database[cell_key].append(pattern_data)
+        
+        # Enforce limits
+        if len(self.pattern_database[cell_key]) > Config.MAX_RECORDS_PER_CELL:
+            self.pattern_database[cell_key] = self.pattern_database[cell_key][-Config.MAX_RECORDS_PER_CELL:]
+        
+        self.total_records += 1
+        
+        # Calculate prediction accuracy if we made one
+        prediction_error = None
+        if round_id in self.predictions_made:
+            predicted_offset = self.predictions_made[round_id]
+            prediction_error = abs(predicted_offset - offset)
             
-            cell_records = self.cells[cell_key]
-            if len(cell_records) > 10:
-                # Remove oldest half from cells with many records
-                remove_count = min(len(cell_records) // 2, target_remove - removed)
-                self.cells[cell_key] = cell_records[remove_count:]
-                removed += remove_count
+            if prediction_error >= 16:  # Half-wheel error
+                logger.warning(f"Large prediction error ({prediction_error} pockets) for round {round_id}")
+            
+            del self.predictions_made[round_id]
         
-        self.total_records -= removed
-        logger.info(f"Cleaned up {removed} old records")
+        # Clean up
+        del self.pending_rounds[round_id]
+        
+        logger.info(f"Finalized round {round_id}: winning={winning_number}, offset={offset}, error={prediction_error}")
+        
+        return {
+            "success": True,
+            "offset": offset,
+            "prediction_error": prediction_error,
+            "total_records": self.total_records
+        }
     
-    def find_matches(self, request: PredictionRequest) -> Tuple[List[int], int, float]:
+    def find_pattern_matches(self, request: PredictionRequest) -> Tuple[Optional[int], float, int]:
         """
-        Find matching records and predict offset
-        Returns: (offset_predictions, confidence_count, confidence_score)
+        Find matching patterns and predict offset
+        Returns: (predicted_offset, confidence, match_count)
         """
-        x, y, speed = request.pos_x, request.pos_y, request.speed_ms_total
-        direction = request.direction
-        
-        if direction not in ['CW', 'CCW']:
-            return [], 0, 0.0
-        
-        # Round to cell
-        x_cell, y_cell, speed_cell = round_to_cell(x, y, speed)
+        cell_key = GridSystem.get_cell_key(
+            request.pos_x,
+            request.pos_y,
+            request.speed_ms_total,
+            request.direction
+        )
         
         matches = []
         weights = []
         
-        # Search expanding rings
-        for radius in range(SEARCH_RADIUS_LIMIT + 1):
-            if radius == 0:
-                # Exact cell match
-                cell_key = (x_cell, y_cell, speed_cell, direction)
-                if cell_key in self.cells:
-                    for record in self.cells[cell_key]:
-                        if 'offset_to_winner' in record:
-                            matches.append(int(record['offset_to_winner']))
-                            weights.append(1.0)
-            else:
-                # Check neighboring cells
-                for dx in [-radius, 0, radius]:
-                    for dy in [-radius, 0, radius]:
-                        for ds in [-radius, 0, radius]:
-                            if abs(dx) == radius or abs(dy) == radius or abs(ds) == radius:
-                                neighbor_key = (
-                                    x_cell + dx * CELL_SIZE_X,
-                                    y_cell + dy * CELL_SIZE_Y,
-                                    speed_cell + ds * CELL_SIZE_SPEED,
-                                    direction
-                                )
-                                if neighbor_key in self.cells:
-                                    for record in self.cells[neighbor_key]:
-                                        if 'offset_to_winner' in record:
-                                            matches.append(int(record['offset_to_winner']))
-                                            weights.append(1.0 / (1 + radius))
+        # Search in expanding radius
+        for radius in range(Config.MAX_SEARCH_RADIUS + 1):
+            cells_to_check = self._get_neighbor_cells(cell_key, radius)
+            
+            for check_cell in cells_to_check:
+                if check_cell in self.pattern_database:
+                    for pattern in self.pattern_database[check_cell]:
+                        matches.append(pattern['offset'])
+                        # Weight by distance and pattern confidence
+                        weight = (1.0 / (1 + radius)) * pattern.get('confidence', 1.0)
+                        weights.append(weight)
             
             # Stop if we have enough matches
-            if len(matches) >= 3:
+            if len(matches) >= Config.MIN_MATCHES_FOR_PREDICTION:
                 break
         
         if not matches:
-            return [], 0, 0.0
+            return None, 0.0, 0
         
-        # Calculate weighted median
-        if len(matches) == 1:
-            predicted_offset = matches[0]
-        else:
-            # Sort matches with their weights
-            sorted_pairs = sorted(zip(matches, weights))
-            matches_sorted = [m for m, _ in sorted_pairs]
-            weights_sorted = [w for _, w in sorted_pairs]
-            
-            # Find weighted median
-            cumsum = 0
-            total = sum(weights_sorted)
-            for i, w in enumerate(weights_sorted):
-                cumsum += w
-                if cumsum >= total / 2:
-                    predicted_offset = matches_sorted[i]
-                    break
+        # Calculate weighted median for prediction
+        predicted_offset = self._weighted_median(matches, weights)
         
-        # Confidence based on number of matches and their spread
-        confidence_count = len(matches)
-        if confidence_count > 1:
-            spread = max(matches) - min(matches)
-            confidence_score = min(1.0, confidence_count / 10.0) * max(0, 1.0 - spread / 18.0)
-        else:
-            confidence_score = 0.3 if confidence_count == 1 else 0.0
+        # Calculate confidence score
+        confidence = self._calculate_confidence(matches, weights)
         
-        return [predicted_offset], confidence_count, confidence_score
+        # Store prediction for later accuracy check
+        self.predictions_made[request.round_id] = predicted_offset
+        
+        return predicted_offset, confidence, len(matches)
+    
+    def _get_neighbor_cells(self, center_cell: Tuple, radius: int) -> List[Tuple]:
+        """Get neighboring grid cells at specified radius"""
+        if radius == 0:
+            return [center_cell]
+        
+        x, y, speed, direction = center_cell
+        neighbors = []
+        
+        for dx in range(-radius, radius + 1):
+            for dy in range(-radius, radius + 1):
+                for ds in range(-radius, radius + 1):
+                    # Check if on radius boundary
+                    if max(abs(dx), abs(dy), abs(ds)) == radius:
+                        neighbor = (
+                            x + dx * Config.POSITION_CELL_SIZE,
+                            y + dy * Config.POSITION_CELL_SIZE,
+                            speed + ds * Config.SPEED_CELL_SIZE,
+                            direction
+                        )
+                        neighbors.append(neighbor)
+        
+        return neighbors
+    
+    def _weighted_median(self, values: List[int], weights: List[float]) -> int:
+        """Calculate weighted median of offset values"""
+        if len(values) == 1:
+            return values[0]
+        
+        # Sort by value with weights
+        sorted_pairs = sorted(zip(values, weights))
+        values_sorted = [v for v, _ in sorted_pairs]
+        weights_sorted = [w for _, w in sorted_pairs]
+        
+        # Find weighted median
+        total_weight = sum(weights_sorted)
+        cumsum = 0
+        
+        for i, w in enumerate(weights_sorted):
+            cumsum += w
+            if cumsum >= total_weight / 2:
+                return values_sorted[i]
+        
+        return values_sorted[-1]
+    
+    def _calculate_confidence(self, matches: List[int], weights: List[float]) -> float:
+        """Calculate confidence score based on matches consistency"""
+        if len(matches) <= 1:
+            return 0.3 if matches else 0.0
+        
+        # Base confidence on match count
+        count_score = min(1.0, len(matches) / 10.0)
+        
+        # Penalize for high variance
+        spread = max(matches) - min(matches)
+        consistency_score = max(0, 1.0 - spread / 18.0)
+        
+        # Weight by match weights
+        weight_score = sum(weights) / len(weights)
+        
+        return count_score * consistency_score * weight_score
+    
+    def _save_to_csv(self, record: Dict[str, Any]):
+        """Append record to CSV database"""
+        try:
+            with open(self.data_path, 'a', newline='', encoding='utf-8') as f:
+                writer = csv.DictWriter(f, fieldnames=Config.CSV_COLUMNS)
+                writer.writerow(record)
+        except Exception as e:
+            logger.error(f"Failed to save record: {e}")
+    
+    def _cleanup_expired_pending(self):
+        """Remove pending rounds older than timeout"""
+        now = datetime.now()
+        expired = []
+        
+        for round_id, data in self.pending_rounds.items():
+            if now - data['timestamp'] > timedelta(minutes=Config.PENDING_TIMEOUT_MINUTES):
+                expired.append(round_id)
+        
+        for round_id in expired:
+            del self.pending_rounds[round_id]
+            if round_id in self.predictions_made:
+                del self.predictions_made[round_id]
+        
+        if expired:
+            logger.info(f"Cleaned up {len(expired)} expired pending rounds")
 
-# Initialize system components
+# ============================================================================
+# API SERVER
+# ============================================================================
+
 app = FastAPI(
-    title="Roulette Prediction Server",
-    description="Pattern matching system for roulette prediction using v17 methodology",
-    version="1.0.0"
+    title="Professional Roulette Prediction Server",
+    description="High-accuracy pattern matching for Evolution Gaming roulette",
+    version="2.0.0"
 )
 
 app.add_middleware(
@@ -357,44 +513,48 @@ app.add_middleware(
     allow_credentials=True
 )
 
+# Initialize storage
 storage = DataStorage()
 
 @app.get("/")
-async def root():
-    """System status endpoint"""
+async def status():
+    """Server status and statistics"""
     return {
-        "server": "Roulette Prediction Server",
+        "server": "Professional Roulette Prediction Server",
+        "version": "2.0.0",
         "status": "operational",
-        "methodology": "v17 pattern matching",
-        "dataset": {
+        "statistics": {
             "total_records": storage.total_records,
-            "cells_populated": len(storage.cells),
-            "pending_rounds": len(storage.pending_rounds)
+            "pattern_cells": len(storage.pattern_database),
+            "pending_rounds": len(storage.pending_rounds),
+            "active_predictions": len(storage.predictions_made)
+        },
+        "configuration": {
+            "min_speed_ms": Config.MIN_BALL_SPEED_MS,
+            "max_speed_ms": Config.MAX_BALL_SPEED_MS,
+            "cell_size_position": Config.POSITION_CELL_SIZE,
+            "cell_size_speed": Config.SPEED_CELL_SIZE
         }
     }
 
 @app.post("/predict")
 async def predict(request: PredictionRequest):
-    """Predict winning number based on current ball state"""
+    """Process prediction request"""
     try:
-        # Validate direction
-        if request.direction not in ['CW', 'CCW']:
+        # Store pending round
+        if not storage.store_pending(request):
             return {
                 "predicted_number": None,
-                "dataset_rows": storage.total_records,
-                "error": "Invalid direction",
-                "confidence": 0
+                "error": "Invalid data - round rejected",
+                "dataset_rows": storage.total_records
             }
         
-        # Save pending data
-        storage.save_pending(request)
+        # Find pattern matches
+        predicted_offset, confidence, matches = storage.find_pattern_matches(request)
         
-        # Find matches and predict
-        offsets, count, confidence = storage.find_matches(request)
-        
-        if offsets and len(offsets) > 0:
-            predicted_offset = offsets[0]
-            predicted_number = get_number_at_offset(
+        if predicted_offset is not None:
+            # Calculate predicted number
+            predicted_number = WheelPhysics.get_number_at_distance(
                 request.number_at_t2,
                 predicted_offset,
                 request.direction
@@ -402,86 +562,91 @@ async def predict(request: PredictionRequest):
             
             return {
                 "predicted_number": predicted_number,
+                "confidence": round(confidence, 3),
+                "matches_found": matches,
                 "dataset_rows": storage.total_records,
-                "confidence": round(confidence, 2),
-                "matches_found": count,
-                "accuracy": {
-                    "error_margin": "N/A" if count < 10 else "±3",
-                    "success_rate_3": f"{min(100, count * 10)}%"
-                },
-                "data_quality": f"{int(confidence * 100)}%"
-            }
-        else:
-            return {
-                "predicted_number": None,
-                "dataset_rows": storage.total_records,
-                "error": "No matching patterns found",
-                "confidence": 0,
-                "data_quality": "0%"
-            }
-    
-    except Exception as e:
-        logger.error(f"Prediction error: {e}")
-        return {
-            "predicted_number": None,
-            "dataset_rows": storage.total_records,
-            "error": str(e)
-        }
-
-@app.post("/log_winner")
-async def log_winner(request: LogWinnerRequest):
-    """Log the winning number for a completed round"""
-    try:
-        success = storage.finalize_round(request.round_id, request.winning_number)
-        
-        if success:
-            return {
-                "ok": True,
-                "stored": True,
-                "dataset_rows": storage.total_records,
-                "winning_number": request.winning_number,
-                "current_accuracy": {
-                    "average_error": "±3",
-                    "success_rate_3": f"{min(100, storage.total_records)}%"
+                "offset_prediction": predicted_offset,
+                "accuracy_metrics": {
+                    "confidence_level": "high" if confidence > 0.7 else "medium" if confidence > 0.4 else "low",
+                    "pattern_strength": f"{int(confidence * 100)}%"
                 }
             }
         else:
             return {
-                "ok": False,
-                "error": "Round not found in pending data"
+                "predicted_number": None,
+                "error": "Insufficient pattern matches",
+                "dataset_rows": storage.total_records,
+                "matches_found": 0
             }
     
     except Exception as e:
-        logger.error(f"Error logging winner: {e}")
-        return {
-            "ok": False,
-            "error": str(e)
-        }
+        logger.error(f"Prediction error: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/log_winner")
+async def log_winner(request: WinnerRequest):
+    """Log winning number for completed round"""
+    try:
+        result = storage.finalize_round(request.round_id, request.winning_number)
+        
+        if result["success"]:
+            response = {
+                "ok": True,
+                "stored": True,
+                "dataset_rows": result["total_records"],
+                "offset_recorded": result["offset"]
+            }
+            
+            if result["prediction_error"] is not None:
+                response["prediction_error"] = result["prediction_error"]
+                response["accuracy"] = "accurate" if result["prediction_error"] <= 3 else "needs_improvement"
+            
+            return response
+        else:
+            return {
+                "ok": False,
+                "error": result["error"],
+                "dataset_rows": storage.total_records
+            }
+    
+    except Exception as e:
+        logger.error(f"Winner logging error: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/statistics")
-async def get_statistics():
-    """Get detailed system statistics"""
-    cell_distribution = {}
-    for cell_key in storage.cells:
+async def statistics():
+    """Detailed system statistics"""
+    cell_stats = {}
+    for cell_key, patterns in storage.pattern_database.items():
         x, y, speed, direction = cell_key
-        key_str = f"pos({x},{y})_speed({speed}ms)_{direction}"
-        cell_distribution[key_str] = len(storage.cells[cell_key])
+        cell_stats[f"{direction}_{speed}ms_({x},{y})"] = len(patterns)
     
     return {
         "total_records": storage.total_records,
-        "cells_populated": len(storage.cells),
+        "pattern_cells": len(storage.pattern_database),
         "pending_rounds": len(storage.pending_rounds),
-        "cell_distribution": cell_distribution,
-        "max_records_per_cell": MAX_RECORDS_PER_CELL,
-        "global_max_records": GLOBAL_MAX_RECORDS
+        "predictions_tracking": len(storage.predictions_made),
+        "cell_distribution": cell_stats,
+        "database_path": storage.data_path
     }
+
+@app.delete("/clear_pending")
+async def clear_pending():
+    """Clear all pending rounds (admin function)"""
+    count = len(storage.pending_rounds)
+    storage.pending_rounds.clear()
+    storage.predictions_made.clear()
+    return {"cleared": count, "message": f"Cleared {count} pending rounds"}
 
 if __name__ == "__main__":
     import uvicorn
-    print("\n" + "="*60)
-    print("ROULETTE PREDICTION SERVER")
-    print("Pure v17 Implementation with Cell-Based Pattern Matching")
-    print("="*60)
-    print(f"Data storage: {DATA_PATH}")
-    print("="*60 + "\n")
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    print("\n" + "="*70)
+    print("PROFESSIONAL ROULETTE PREDICTION SERVER v2.0.0")
+    print("High-accuracy pattern matching for Evolution Gaming")
+    print("="*70)
+    print(f"Database: {storage.data_path}")
+    print(f"Records loaded: {storage.total_records}")
+    print(f"Pattern cells: {len(storage.pattern_database)}")
+    print("="*70 + "\n")
+    
+    uvicorn.run(app, host="0.0.0.0", port=8000, log_level="info")
