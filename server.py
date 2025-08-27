@@ -16,7 +16,7 @@ from enum import Enum
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, Field, validator
+from pydantic import BaseModel, Field, field_validator
 
 # Configure professional logging
 logging.basicConfig(
@@ -82,16 +82,24 @@ class PredictionRequest(BaseModel):
     pos_y: float = Field(..., ge=0, le=2000)
     speed_ms_total: int = Field(..., ge=100, le=5000)
     traveled_pockets: int = Field(default=7, ge=1, le=37)
-    direction: str = Field(..., regex="^(CW|CCW)$")
+    direction: str = Field(..., description="Ball direction: CW or CCW")
     number_at_t1: int = Field(..., ge=0, le=36)
     number_at_t2: int = Field(..., ge=0, le=36)
     table_id: str = Field(default="default", max_length=50)
     direction_confidence: Optional[float] = Field(default=None, ge=0, le=1)
     
-    @validator('speed_ms_total')
+    @field_validator('speed_ms_total')
+    @classmethod
     def validate_speed(cls, v):
         if v < Config.MIN_BALL_SPEED_MS:
             raise ValueError(f"Speed {v}ms below minimum {Config.MIN_BALL_SPEED_MS}ms")
+        return v
+    
+    @field_validator('direction')
+    @classmethod
+    def validate_direction(cls, v):
+        if v not in ['CW', 'CCW']:
+            raise ValueError('Direction must be CW or CCW')
         return v
 
 class WinnerRequest(BaseModel):
