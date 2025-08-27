@@ -351,7 +351,7 @@ class DataStorage:
         # Calculate prediction accuracy if we made one
         prediction_error = None
         if round_id in self.predictions_made:
-            predicted_offset = self.predictions_made[round_id]
+            predicted_offset = self.predictions_made[round_id]['main_offset']
             prediction_error = abs(predicted_offset - offset)
             
             if prediction_error >= 16:  # Half-wheel error
@@ -371,10 +371,10 @@ class DataStorage:
             "total_records": self.total_records
         }
     
-    def find_pattern_matches(self, request: PredictionRequest) -> Tuple[Optional[int], float, int]:
+    def find_pattern_matches(self, request: PredictionRequest) -> Tuple[List[int], Optional[int], float, int]:
         """
         Find matching patterns and predict offset
-        Returns: (predicted_offset, confidence, match_count)
+        Returns: (predicted_numbers_list, main_predicted_number, confidence, match_count)
         """
         cell_key = GridSystem.get_cell_key(
             request.pos_x,
@@ -383,8 +383,9 @@ class DataStorage:
             request.direction
         )
         
-        matches = []
-        weights = []
+        # Collect all matches with weights
+        offset_weights = defaultdict(float)
+        total_matches = 0
         
         # Search in expanding radius
         for radius in range(Config.MAX_SEARCH_RADIUS + 1):
@@ -393,28 +394,46 @@ class DataStorage:
             for check_cell in cells_to_check:
                 if check_cell in self.pattern_database:
                     for pattern in self.pattern_database[check_cell]:
-                        matches.append(pattern['offset'])
+                        offset = pattern['offset']
                         # Weight by distance and pattern confidence
                         weight = (1.0 / (1 + radius)) * pattern.get('confidence', 1.0)
-                        weights.append(weight)
-            
-            # Stop if we have enough matches
-            if len(matches) >= Config.MIN_MATCHES_FOR_PREDICTION:
-                break
+                        offset_weights[offset] += weight
+                        total_matches += 1
         
-        if not matches:
-            return None, 0.0, 0
+        if not offset_weights:
+            return [], None, 0.0, 0
         
-        # Calculate weighted median for prediction
-        predicted_offset = self._weighted_median(matches, weights)
+        # Sort offsets by total weight
+        sorted_offsets = sorted(offset_weights.items(), key=lambda x: x[1], reverse=True)
         
-        # Calculate confidence score
-        confidence = self._calculate_confidence(matches, weights)
+        # Take top 7 offsets
+        top_offsets = [offset for offset, _ in sorted_offsets[:7]]
         
-        # Store prediction for later accuracy check
-        self.predictions_made[request.round_id] = predicted_offset
+        # Convert offsets to numbers
+        predicted_numbers = []
+        for offset in top_offsets:
+            number = WheelPhysics.get_number_at_distance(
+                request.number_at_t2,
+                offset,
+                request.direction
+            )
+            predicted_numbers.append(number)
         
-        return predicted_offset, confidence, len(matches)
+        # Main prediction is the highest weighted
+        main_offset = top_offsets[0] if top_offsets else None
+        main_number = predicted_numbers[0] if predicted_numbers else None
+        
+        # Calculate confidence based on matches and consistency
+        confidence = self._calculate_confidence(offset_weights, total_matches)
+        
+        # Store prediction for accuracy tracking
+        if main_offset is not None:
+            self.predictions_made[request.round_id] = {
+                'main_offset': main_offset,
+                'all_offsets': top_offsets
+            }
+        
+        return predicted_numbers, main_number, confidence, total_matches
     
     def _get_neighbor_cells(self, center_cell: Tuple, radius: int) -> List[Tuple]:
         """Get neighboring grid cells at specified radius"""
@@ -439,43 +458,23 @@ class DataStorage:
         
         return neighbors
     
-    def _weighted_median(self, values: List[int], weights: List[float]) -> int:
-        """Calculate weighted median of offset values"""
-        if len(values) == 1:
-            return values[0]
-        
-        # Sort by value with weights
-        sorted_pairs = sorted(zip(values, weights))
-        values_sorted = [v for v, _ in sorted_pairs]
-        weights_sorted = [w for _, w in sorted_pairs]
-        
-        # Find weighted median
-        total_weight = sum(weights_sorted)
-        cumsum = 0
-        
-        for i, w in enumerate(weights_sorted):
-            cumsum += w
-            if cumsum >= total_weight / 2:
-                return values_sorted[i]
-        
-        return values_sorted[-1]
-    
-    def _calculate_confidence(self, matches: List[int], weights: List[float]) -> float:
+    def _calculate_confidence(self, offset_weights: Dict[int, float], total_matches: int) -> float:
         """Calculate confidence score based on matches consistency"""
-        if len(matches) <= 1:
-            return 0.3 if matches else 0.0
+        if total_matches < Config.MIN_MATCHES_FOR_PREDICTION:
+            return 0.2
+        
+        if not offset_weights:
+            return 0.0
         
         # Base confidence on match count
-        count_score = min(1.0, len(matches) / 10.0)
+        count_score = min(1.0, total_matches / 20.0)
         
-        # Penalize for high variance
-        spread = max(matches) - min(matches)
-        consistency_score = max(0, 1.0 - spread / 18.0)
+        # Check concentration of predictions
+        top_weight = max(offset_weights.values())
+        total_weight = sum(offset_weights.values())
+        concentration_score = top_weight / total_weight if total_weight > 0 else 0
         
-        # Weight by match weights
-        weight_score = sum(weights) / len(weights)
-        
-        return count_score * consistency_score * weight_score
+        return count_score * concentration_score
     
     def _save_to_csv(self, record: Dict[str, Any]):
         """Append record to CSV database"""
@@ -553,27 +552,21 @@ async def predict(request: PredictionRequest):
         if not storage.store_pending(request):
             return {
                 "predicted_number": None,
+                "predicted_sector": [],
                 "error": "Invalid data - round rejected",
                 "dataset_rows": storage.total_records
             }
         
         # Find pattern matches
-        predicted_offset, confidence, matches = storage.find_pattern_matches(request)
+        predicted_sector, main_prediction, confidence, matches = storage.find_pattern_matches(request)
         
-        if predicted_offset is not None:
-            # Calculate predicted number
-            predicted_number = WheelPhysics.get_number_at_distance(
-                request.number_at_t2,
-                predicted_offset,
-                request.direction
-            )
-            
+        if predicted_sector and main_prediction is not None:
             return {
-                "predicted_number": predicted_number,
+                "predicted_number": main_prediction,
+                "predicted_sector": predicted_sector,
                 "confidence": round(confidence, 3),
                 "matches_found": matches,
                 "dataset_rows": storage.total_records,
-                "offset_prediction": predicted_offset,
                 "accuracy_metrics": {
                     "confidence_level": "high" if confidence > 0.7 else "medium" if confidence > 0.4 else "low",
                     "pattern_strength": f"{int(confidence * 100)}%"
@@ -582,6 +575,7 @@ async def predict(request: PredictionRequest):
         else:
             return {
                 "predicted_number": None,
+                "predicted_sector": [],
                 "error": "Insufficient pattern matches",
                 "dataset_rows": storage.total_records,
                 "matches_found": 0
