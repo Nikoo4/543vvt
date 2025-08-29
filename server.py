@@ -34,22 +34,23 @@ logger = logging.getLogger("RouletteServer")
 # ============================================================================
 
 class Config:
-    """Server configuration parameters"""
-    # Grid cell sizes for pattern matching
-    POSITION_CELL_SIZE = 5  # pixels
-    SPEED_CELL_SIZE = 10     # milliseconds
+    """Server configuration parameters optimized for accuracy"""
+    # Grid cell sizes for pattern matching - tighter grid for better accuracy
+    POSITION_CELL_SIZE = 2  # pixels - reduced from 5 for more precise matching
+    SPEED_CELL_SIZE = 15     # milliseconds - wider tolerance for timing variations
     
     # Data management
     MAX_RECORDS_PER_CELL = 100
     GLOBAL_MAX_RECORDS = 500000
     PENDING_TIMEOUT_MINUTES = 10
+    DATA_RETENTION_DAYS = 30  # Keep only recent data for predictions
     
     # Search parameters
-    MAX_SEARCH_RADIUS = 3
-    MIN_MATCHES_FOR_PREDICTION = 5
+    MAX_SEARCH_RADIUS = 1  # Reduced from 3 - only look at very close matches
+    MIN_MATCHES_FOR_PREDICTION = 30  # Increased from 5 - need more confidence
     
     # Validation
-    MIN_BALL_SPEED_MS = 400
+    MIN_BALL_SPEED_MS = 300  # Reduced from 400
     MAX_BALL_SPEED_MS = 3000
     VALID_DIRECTIONS = ['CW', 'CCW']
     
@@ -219,26 +220,34 @@ class DataStorage:
             logger.info("Initialized new database")
     
     def _load_existing_data(self):
-        """Load historical data into memory for pattern matching"""
+        """Load historical data into memory for pattern matching - only recent data"""
         if not os.path.exists(self.data_path):
             return
             
         try:
+            cutoff_date = datetime.now() - timedelta(days=Config.DATA_RETENTION_DAYS)
+            
             with open(self.data_path, 'r', encoding='utf-8') as f:
                 reader = csv.DictReader(f)
                 loaded = 0
                 
                 for row in reader:
                     # Validate row data
-                    if not all(k in row for k in ['pos_x', 'pos_y', 'speed_ms', 'direction', 'offset_from_t2']):
+                    if not all(k in row for k in ['pos_x', 'pos_y', 'speed_ms', 'direction', 'offset_from_t2', 'timestamp']):
                         continue
                     
                     try:
+                        # Check if data is recent enough
+                        row_timestamp = datetime.fromisoformat(row['timestamp'])
+                        if row_timestamp < cutoff_date:
+                            continue  # Skip old data
+                        
                         # Parse and validate
                         x = float(row['pos_x'])
                         y = float(row['pos_y'])
                         speed = int(row['speed_ms'])
                         direction = row['direction']
+                        traveled_pockets = int(row.get('traveled_pockets', 7))
                         
                         if direction not in Config.VALID_DIRECTIONS:
                             continue
@@ -250,7 +259,8 @@ class DataStorage:
                         pattern_data = {
                             'offset': int(row['offset_from_t2']),
                             'timestamp': row['timestamp'],
-                            'confidence': float(row.get('confidence', 1.0))
+                            'confidence': float(row.get('confidence', 1.0)),
+                            'traveled_pockets': traveled_pockets
                         }
                         
                         self.pattern_database[cell_key].append(pattern_data)
@@ -264,15 +274,21 @@ class DataStorage:
                         continue
                 
                 self.total_records = loaded
-                logger.info(f"Loaded {loaded} historical records into {len(self.pattern_database)} grid cells")
+                logger.info(f"Loaded {loaded} recent records (last {Config.DATA_RETENTION_DAYS} days) into {len(self.pattern_database)} grid cells")
                 
         except Exception as e:
             logger.error(f"Error loading database: {e}")
     
     def store_pending(self, request: PredictionRequest) -> bool:
         """Store round data temporarily until winning number arrives"""
-        # Clean expired pending rounds
-        self._cleanup_expired_pending()
+        # If there are pending rounds waiting, clear them all
+        # New data means previous round ended without logging winner
+        if self.pending_rounds:
+            old_count = len(self.pending_rounds)
+            self.pending_rounds.clear()
+            # Also clear any predictions made for those rounds
+            self.predictions_made.clear()
+            logger.info(f"Cleared {old_count} pending rounds - new round data received")
         
         # Validate direction
         if request.direction not in Config.VALID_DIRECTIONS:
@@ -337,7 +353,8 @@ class DataStorage:
         pattern_data = {
             'offset': offset,
             'timestamp': complete_record['timestamp'],
-            'confidence': round_data.get('direction_confidence', 1.0)
+            'confidence': round_data.get('direction_confidence', 1.0),
+            'traveled_pockets': round_data['traveled_pockets']
         }
         
         self.pattern_database[cell_key].append(pattern_data)
@@ -371,10 +388,10 @@ class DataStorage:
             "total_records": self.total_records
         }
     
-    def find_pattern_matches(self, request: PredictionRequest) -> Tuple[List[int], Optional[int], float, int]:
+    def find_pattern_matches(self, request: PredictionRequest) -> Tuple[Optional[int], float, int]:
         """
-        Find matching patterns and predict offset
-        Returns: (predicted_numbers_list, main_predicted_number, confidence, match_count)
+        Find matching patterns and predict single best number
+        Returns: (predicted_number, confidence, match_count)
         """
         cell_key = GridSystem.get_cell_key(
             request.pos_x,
@@ -387,53 +404,56 @@ class DataStorage:
         offset_weights = defaultdict(float)
         total_matches = 0
         
-        # Search in expanding radius
+        # Search in limited radius for more precise matching
         for radius in range(Config.MAX_SEARCH_RADIUS + 1):
             cells_to_check = self._get_neighbor_cells(cell_key, radius)
             
             for check_cell in cells_to_check:
                 if check_cell in self.pattern_database:
                     for pattern in self.pattern_database[check_cell]:
+                        # Filter old data even from memory
+                        pattern_time = datetime.fromisoformat(pattern['timestamp'])
+                        if datetime.now() - pattern_time > timedelta(days=Config.DATA_RETENTION_DAYS):
+                            continue
+                        
+                        # Filter by traveled pockets similarity
+                        if abs(pattern.get('traveled_pockets', 7) - request.traveled_pockets) > 2:
+                            continue
+                        
                         offset = pattern['offset']
                         # Weight by distance and pattern confidence
                         weight = (1.0 / (1 + radius)) * pattern.get('confidence', 1.0)
                         offset_weights[offset] += weight
                         total_matches += 1
         
+        if total_matches < Config.MIN_MATCHES_FOR_PREDICTION:
+            return None, 0.0, total_matches
+        
+        # Find the most probable offset
         if not offset_weights:
-            return [], None, 0.0, 0
+            return None, 0.0, 0
         
-        # Sort offsets by total weight
-        sorted_offsets = sorted(offset_weights.items(), key=lambda x: x[1], reverse=True)
+        # Get the offset with highest weight
+        best_offset = max(offset_weights.items(), key=lambda x: x[1])[0]
         
-        # Take top 7 offsets
-        top_offsets = [offset for offset, _ in sorted_offsets[:7]]
+        # Convert offset to predicted number
+        predicted_number = WheelPhysics.get_number_at_distance(
+            request.number_at_t2,
+            best_offset,
+            request.direction
+        )
         
-        # Convert offsets to numbers
-        predicted_numbers = []
-        for offset in top_offsets:
-            number = WheelPhysics.get_number_at_distance(
-                request.number_at_t2,
-                offset,
-                request.direction
-            )
-            predicted_numbers.append(number)
-        
-        # Main prediction is the highest weighted
-        main_offset = top_offsets[0] if top_offsets else None
-        main_number = predicted_numbers[0] if predicted_numbers else None
-        
-        # Calculate confidence based on matches and consistency
+        # Calculate confidence based on consistency
         confidence = self._calculate_confidence(offset_weights, total_matches)
         
         # Store prediction for accuracy tracking
-        if main_offset is not None:
+        if predicted_number is not None:
             self.predictions_made[request.round_id] = {
-                'main_offset': main_offset,
-                'all_offsets': top_offsets
+                'main_offset': best_offset,
+                'predicted_number': predicted_number
             }
         
-        return predicted_numbers, main_number, confidence, total_matches
+        return predicted_number, confidence, total_matches
     
     def _get_neighbor_cells(self, center_cell: Tuple, radius: int) -> List[Tuple]:
         """Get neighboring grid cells at specified radius"""
@@ -459,22 +479,25 @@ class DataStorage:
         return neighbors
     
     def _calculate_confidence(self, offset_weights: Dict[int, float], total_matches: int) -> float:
-        """Calculate confidence score based on matches consistency"""
+        """Calculate confidence score based on pattern consistency"""
         if total_matches < Config.MIN_MATCHES_FOR_PREDICTION:
-            return 0.2
+            return 0.0
         
         if not offset_weights:
             return 0.0
         
-        # Base confidence on match count
-        count_score = min(1.0, total_matches / 20.0)
-        
-        # Check concentration of predictions
+        # Get the highest weight
         top_weight = max(offset_weights.values())
         total_weight = sum(offset_weights.values())
-        concentration_score = top_weight / total_weight if total_weight > 0 else 0
         
-        return count_score * concentration_score
+        # Calculate consistency - what percentage of matches point to the same result
+        consistency = top_weight / total_weight if total_weight > 0 else 0
+        
+        # Only return high confidence if 60%+ matches agree on the same offset
+        if consistency >= 0.6:
+            return consistency
+        else:
+            return 0.3  # Low confidence even if we have matches
     
     def _save_to_csv(self, record: Dict[str, Any]):
         """Append record to CSV database"""
@@ -485,7 +508,46 @@ class DataStorage:
         except Exception as e:
             logger.error(f"Failed to save record: {e}")
     
-    def _cleanup_expired_pending(self):
+    def cleanup_old_csv_data(self):
+        """Remove old records from CSV file while preserving recent data"""
+        try:
+            # Only cleanup if we have enough data
+            if self.total_records < 50000:
+                return
+            
+            cutoff_date = datetime.now() - timedelta(days=60)  # Keep 60 days in file
+            temp_file = self.data_path + '.tmp'
+            kept_records = 0
+            removed_records = 0
+            
+            # Read and filter data
+            with open(self.data_path, 'r', encoding='utf-8') as old_file:
+                with open(temp_file, 'w', newline='', encoding='utf-8') as new_file:
+                    reader = csv.DictReader(old_file)
+                    writer = csv.DictWriter(new_file, fieldnames=Config.CSV_COLUMNS)
+                    writer.writeheader()
+                    
+                    for row in reader:
+                        try:
+                            row_time = datetime.fromisoformat(row['timestamp'])
+                            if row_time >= cutoff_date:
+                                writer.writerow(row)
+                                kept_records += 1
+                            else:
+                                removed_records += 1
+                        except:
+                            # Keep records with invalid timestamps
+                            writer.writerow(row)
+                            kept_records += 1
+            
+            # Replace old file with cleaned one
+            os.replace(temp_file, self.data_path)
+            logger.info(f"CSV cleanup complete: kept {kept_records}, removed {removed_records} old records")
+            
+        except Exception as e:
+            logger.error(f"Error during CSV cleanup: {e}")
+            if os.path.exists(temp_file):
+                os.remove(temp_file)
         """Remove pending rounds older than timeout"""
         now = datetime.now()
         expired = []
@@ -523,6 +585,12 @@ app.add_middleware(
 # Initialize storage
 storage = DataStorage()
 
+# Run cleanup on startup (and optionally schedule periodic cleanup)
+@app.on_event("startup")
+async def startup_event():
+    """Run maintenance tasks on server startup"""
+    storage.cleanup_old_csv_data()
+
 @app.get("/")
 async def status():
     """Server status and statistics"""
@@ -540,45 +608,45 @@ async def status():
             "min_speed_ms": Config.MIN_BALL_SPEED_MS,
             "max_speed_ms": Config.MAX_BALL_SPEED_MS,
             "cell_size_position": Config.POSITION_CELL_SIZE,
-            "cell_size_speed": Config.SPEED_CELL_SIZE
+            "cell_size_speed": Config.SPEED_CELL_SIZE,
+            "min_matches_required": Config.MIN_MATCHES_FOR_PREDICTION
         }
     }
 
 @app.post("/predict")
 async def predict(request: PredictionRequest):
-    """Process prediction request"""
+    """Process prediction request and return single best number"""
     try:
         # Store pending round
         if not storage.store_pending(request):
             return {
                 "predicted_number": None,
-                "predicted_sector": [],
+                "confidence": 0,
                 "error": "Invalid data - round rejected",
                 "dataset_rows": storage.total_records
             }
         
         # Find pattern matches
-        predicted_sector, main_prediction, confidence, matches = storage.find_pattern_matches(request)
+        predicted_number, confidence, matches = storage.find_pattern_matches(request)
         
-        if predicted_sector and main_prediction is not None:
+        if predicted_number is not None and confidence > 0.3:
             return {
-                "predicted_number": main_prediction,
-                "predicted_sector": predicted_sector,
+                "predicted_number": predicted_number,
                 "confidence": round(confidence, 3),
                 "matches_found": matches,
                 "dataset_rows": storage.total_records,
                 "accuracy_metrics": {
-                    "confidence_level": "high" if confidence > 0.7 else "medium" if confidence > 0.4 else "low",
+                    "confidence_level": "high" if confidence > 0.7 else "medium" if confidence > 0.5 else "low",
                     "pattern_strength": f"{int(confidence * 100)}%"
                 }
             }
         else:
             return {
                 "predicted_number": None,
-                "predicted_sector": [],
-                "error": "Insufficient pattern matches",
+                "confidence": 0,
+                "error": f"Insufficient pattern matches. Found {matches}, need {Config.MIN_MATCHES_FOR_PREDICTION}+",
                 "dataset_rows": storage.total_records,
-                "matches_found": 0
+                "matches_found": matches
             }
     
     except Exception as e:
@@ -629,7 +697,8 @@ async def statistics():
         "pending_rounds": len(storage.pending_rounds),
         "predictions_tracking": len(storage.predictions_made),
         "cell_distribution": cell_stats,
-        "database_path": storage.data_path
+        "database_path": storage.data_path,
+        "data_retention_days": Config.DATA_RETENTION_DAYS
     }
 
 @app.delete("/clear_pending")
@@ -649,6 +718,7 @@ if __name__ == "__main__":
     print(f"Database: {storage.data_path}")
     print(f"Records loaded: {storage.total_records}")
     print(f"Pattern cells: {len(storage.pattern_database)}")
+    print(f"Data retention: {Config.DATA_RETENTION_DAYS} days")
     print("="*70 + "\n")
     
-    uvicorn.run(app, host="0.0.0.0", port=8000, log_level="info")
+    uvicorn.run(app, host="0.0.0.0", port=9999, log_level="info")
