@@ -721,4 +721,4 @@ if __name__ == "__main__":
     print(f"Data retention: {Config.DATA_RETENTION_DAYS} days")
     print("="*70 + "\n")
     
-    uvicorn.run(app, host="0.0.0.0", port=9999, log_level="info")
+    uvicorn.run(app, host="0.0.0.0", port=8000, log_level="info")
