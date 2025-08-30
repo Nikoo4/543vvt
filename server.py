@@ -124,8 +124,10 @@ class WheelPhysics:
         from_idx = Config.POCKET_TO_INDEX.get(from_number)
         to_idx = Config.POCKET_TO_INDEX.get(to_number)
         
+        # FIXED: Handle invalid pocket numbers gracefully
         if from_idx is None or to_idx is None:
-            raise ValueError(f"Invalid pocket numbers: {from_number}, {to_number}")
+            logger.warning(f"Invalid pocket numbers: from={from_number}, to={to_number}")
+            return 0  # Return 0 instead of raising exception
         
         if direction == "CW":
             # Clockwise: calculate forward distance
@@ -145,8 +147,10 @@ class WheelPhysics:
         """Get pocket number at specified distance from reference"""
         from_idx = Config.POCKET_TO_INDEX.get(from_number)
         
+        # FIXED: Handle invalid pocket number gracefully
         if from_idx is None:
-            raise ValueError(f"Invalid pocket number: {from_number}")
+            logger.warning(f"Invalid pocket number: {from_number}")
+            return from_number  # Return same number instead of error
         
         if direction == "CW":
             target_idx = (from_idx + distance) % 37
@@ -421,8 +425,14 @@ class DataStorage:
                             continue
                         
                         offset = pattern['offset']
+                        
+                        # FIXED: Ensure confidence is never None
+                        confidence_value = pattern.get('confidence', 1.0)
+                        if confidence_value is None:
+                            confidence_value = 1.0
+                            
                         # Weight by distance and pattern confidence
-                        weight = (1.0 / (1 + radius)) * pattern.get('confidence', 1.0)
+                        weight = (1.0 / (1 + radius)) * confidence_value
                         offset_weights[offset] += weight
                         total_matches += 1
         
@@ -490,8 +500,12 @@ class DataStorage:
         top_weight = max(offset_weights.values())
         total_weight = sum(offset_weights.values())
         
+        # FIXED: Ensure no division by zero
+        if total_weight == 0:
+            return 0.0
+            
         # Calculate consistency - what percentage of matches point to the same result
-        consistency = top_weight / total_weight if total_weight > 0 else 0
+        consistency = top_weight / total_weight
         
         # Only return high confidence if 60%+ matches agree on the same offset
         if consistency >= 0.6:
@@ -548,6 +562,8 @@ class DataStorage:
             logger.error(f"Error during CSV cleanup: {e}")
             if os.path.exists(temp_file):
                 os.remove(temp_file)
+    
+    def cleanup_pending_rounds(self):
         """Remove pending rounds older than timeout"""
         now = datetime.now()
         expired = []
@@ -590,6 +606,7 @@ storage = DataStorage()
 async def startup_event():
     """Run maintenance tasks on server startup"""
     storage.cleanup_old_csv_data()
+    storage.cleanup_pending_rounds()
 
 @app.get("/")
 async def status():
