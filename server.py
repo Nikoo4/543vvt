@@ -36,7 +36,7 @@ logger = logging.getLogger("RouletteServer")
 class Config:
     """Server configuration parameters optimized for accuracy"""
     # Grid cell sizes for pattern matching - tighter grid for better accuracy
-    POSITION_CELL_SIZE = 2  # pixels - reduced from 5 for more precise matching
+    POSITION_CELL_SIZE = 15  # pixels - reduced from 5 for more precise matching
     SPEED_CELL_SIZE = 15     # milliseconds - wider tolerance for timing variations
     
     # Data management
