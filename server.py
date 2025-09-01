@@ -47,7 +47,7 @@ class Config:
     
     # Search parameters
     MAX_SEARCH_RADIUS = 1  # Reduced from 3 - only look at very close matches
-    MIN_MATCHES_FOR_PREDICTION = 30  # Increased from 5 - need more confidence
+    MIN_MATCHES_FOR_PREDICTION = 10  # Increased from 5 - need more confidence
     
     # Validation
     MIN_BALL_SPEED_MS = 300  # Reduced from 400
