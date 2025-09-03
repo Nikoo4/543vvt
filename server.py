@@ -10,9 +10,11 @@ import math
 import time
 import logging
 import hashlib
+import numpy as np
 from datetime import datetime, timedelta
 from collections import defaultdict, deque
 from typing import List, Dict, Any, Optional, Tuple
+from enum import Enum
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -144,9 +146,14 @@ class PhysicsEngine:
             time_between_measurements = request.lap2_ms / 1000.0
             ball_deceleration = (omega_ball_t3 - omega_ball_t2) / time_between_measurements
             
-            # Validate deceleration
-            if ball_deceleration >= -Config.MIN_DECELERATION:
-                return None, 0.0, [], {"error": "Insufficient deceleration", "decel": round(ball_deceleration, 3)}
+            # Additional validation
+            deceleration_percentage = (request.lap2_ms - request.lap1_ms) / request.lap1_ms
+            if deceleration_percentage < 0.02:
+                return None, 0.0, [], {"error": "Insufficient deceleration", "decel_pct": round(deceleration_percentage * 100, 1)}
+            
+            # Validate deceleration is reasonable
+            if ball_deceleration >= -Config.MIN_DECELERATION or ball_deceleration < -10.0:
+                return None, 0.0, [], {"error": "Deceleration out of valid range", "decel": round(ball_deceleration, 3)}
             
             # 3. Calculate rotor velocity
             rotor_pockets_per_sec = request.rotor_shift / (request.lap1_ms / 1000.0)
@@ -254,7 +261,9 @@ class PhysicsEngine:
         # Adjust based on scatter data if available
         if scatter_data and len(scatter_data) > 10:
             # Calculate standard deviation of scatter
-            scatter_std = np.std([d['offset'] for d in scatter_data])
+            mean = sum([d['offset'] for d in scatter_data]) / len(scatter_data)
+            variance = sum((d['offset'] - mean) ** 2 for d in scatter_data) / len(scatter_data)
+            scatter_std = variance ** 0.5
             # Adjust sector size based on scatter
             sector_size = min(13, max(7, int(2 * scatter_std + 1)))
         
