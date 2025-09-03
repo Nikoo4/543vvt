@@ -1,6 +1,6 @@
 """
-Enhanced Roulette Prediction Server with Physics Model
-Combines pattern matching with physics calculations for improved accuracy
+Enhanced Roulette Prediction Server with Corrected Physics Model
+Three-point measurement system with proper ball/rotor velocity calculations
 """
 
 import os
@@ -10,6 +10,7 @@ import math
 import time
 import logging
 import hashlib
+import numpy as np
 from datetime import datetime, timedelta
 from collections import defaultdict, deque
 from typing import List, Dict, Any, Optional, Tuple
@@ -24,46 +25,40 @@ logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s | %(name)s | %(levelname)s | %(message)s',
     handlers=[
-        logging.FileHandler('roulette_physics_server.log'),
+        logging.FileHandler('roulette_enhanced_server.log'),
         logging.StreamHandler()
     ]
 )
-logger = logging.getLogger("PhysicsRouletteServer")
+logger = logging.getLogger("EnhancedRouletteServer")
 
 # ============================================================================
 # CONFIGURATION
 # ============================================================================
 
 class Config:
-    """Server configuration with physics constants"""
-    
-    # Grid parameters for hybrid approach
-    POSITION_CELL_SIZE = 5   # pixels - more precise than before
-    SPEED_CELL_SIZE = 10     # milliseconds
+    """Server configuration with corrected physics constants"""
     
     # Data management
-    MAX_RECORDS_PER_CELL = 200
-    GLOBAL_MAX_RECORDS = 1000000
+    MAX_RECORDS = 2000000
     PENDING_TIMEOUT_MINUTES = 10
-    DATA_RETENTION_DAYS = 60
+    DATA_RETENTION_DAYS = 90
     
     # Physics constants
     GRAVITY = 9.81                # m/s²
     WHEEL_RADIUS = 0.38           # meters (standard roulette wheel)
     BALL_RADIUS = 0.01            # meters
     CRITICAL_VELOCITY = 0.8       # rad/s - velocity when ball drops
-    BASE_FRICTION_COEFF = 0.025   # initial friction coefficient
     AIR_RESISTANCE_COEFF = 0.0001 # air drag coefficient
     
     # Prediction parameters
-    MIN_MATCHES_FOR_PREDICTION = 5    # reduced since physics helps
-    MIN_CONFIDENCE_THRESHOLD = 0.25   # lowered threshold
-    SECTOR_SIZE = 8                   # predict 8-number sectors
+    MIN_CONFIDENCE_THRESHOLD = 0.4   # Raised threshold
+    SECTOR_SIZE = 9                  # predict 9-number sectors (center + 4 each side)
+    MIN_DECELERATION = 0.1          # Minimum valid deceleration
+    MAX_TIME_TO_DROP = 10.0         # Maximum reasonable time to drop
     
     # Validation
-    MIN_BALL_SPEED_MS = 300
-    MAX_BALL_SPEED_MS = 3000
-    MIN_TRAVELED_POCKETS = 5         # filter out very slow spins
+    MIN_LAP_TIME_MS = 200
+    MAX_LAP_TIME_MS = 3000
     VALID_DIRECTIONS = ['CW', 'CCW']
     
     # European wheel layout (single zero, clockwise order)
@@ -79,10 +74,12 @@ class Config:
     # CSV structure
     CSV_COLUMNS = [
         'timestamp', 'round_id', 'table_id',
-        'pos_x', 'pos_y', 'speed_ms', 'traveled_pockets',
-        'direction', 'number_t1', 'number_t2', 
-        'winning_number', 'offset_from_t2',
-        'predicted_physics', 'predicted_pattern', 'error_physics', 'error_pattern'
+        'pos_x', 'pos_y', 'lap1_ms', 'lap2_ms',
+        'rotor_shift', 'rotor_direction', 'ball_direction',
+        'number_t1', 'number_t2', 'number_t3', 'phase_t2',
+        'winning_number', 'offset_from_t3',
+        'predicted_physics', 'predicted_sector', 
+        'error_physics', 'confidence'
     ]
 
 # ============================================================================
@@ -90,32 +87,29 @@ class Config:
 # ============================================================================
 
 class PredictionRequest(BaseModel):
-    """Incoming prediction request from client"""
+    """Enhanced prediction request with three-point data"""
     round_id: str = Field(..., min_length=5, max_length=50)
     pos_x: float = Field(..., ge=0, le=2000)
     pos_y: float = Field(..., ge=0, le=2000)
-    speed_ms_total: int = Field(..., ge=100, le=5000)
-    traveled_pockets: int = Field(default=7, ge=1, le=37)
+    lap1_ms: int = Field(..., ge=100, le=5000, description="Time for first lap (T1 to T2)")
+    lap2_ms: int = Field(..., ge=100, le=5000, description="Time for second lap (T2 to T3)")
+    rotor_shift: int = Field(..., ge=0, le=18, description="Rotor movement in pockets during lap1")
+    rotor_direction: str = Field(..., description="Rotor direction: CW or CCW")
     direction: str = Field(..., description="Ball direction: CW or CCW")
     number_at_t1: int = Field(..., ge=0, le=36)
     number_at_t2: int = Field(..., ge=0, le=36)
+    number_at_t3: int = Field(..., ge=0, le=36)
+    phase_at_t2: float = Field(default=0.0, ge=0, lt=1, description="Fractional position within pocket")
     table_id: str = Field(default="default", max_length=50)
     
-    @field_validator('speed_ms_total')
+    @field_validator('lap1_ms', 'lap2_ms')
     @classmethod
-    def validate_speed(cls, v):
-        if v < Config.MIN_BALL_SPEED_MS:
-            raise ValueError(f"Speed {v}ms below minimum {Config.MIN_BALL_SPEED_MS}ms")
+    def validate_lap_times(cls, v):
+        if v < Config.MIN_LAP_TIME_MS or v > Config.MAX_LAP_TIME_MS:
+            raise ValueError(f"Lap time {v}ms out of valid range [{Config.MIN_LAP_TIME_MS}, {Config.MAX_LAP_TIME_MS}]")
         return v
     
-    @field_validator('traveled_pockets')
-    @classmethod
-    def validate_pockets(cls, v):
-        if v < Config.MIN_TRAVELED_POCKETS:
-            raise ValueError(f"Traveled pockets {v} below minimum {Config.MIN_TRAVELED_POCKETS}")
-        return v
-    
-    @field_validator('direction')
+    @field_validator('direction', 'rotor_direction')
     @classmethod
     def validate_direction(cls, v):
         if v not in Config.VALID_DIRECTIONS:
@@ -132,179 +126,167 @@ class WinnerRequest(BaseModel):
 # ============================================================================
 
 class PhysicsEngine:
-    """Physics calculations for ball trajectory prediction"""
+    """Enhanced physics calculations using three-point measurement"""
     
     def __init__(self):
-        self.friction_map = {}  # Position-based friction coefficients
+        self.scatter_models = defaultdict(list)  # Position-based scatter patterns
         self.calibration_data = defaultdict(list)
     
-    def calculate_prediction(self, request: PredictionRequest) -> Tuple[Optional[int], float, Dict]:
+    def calculate_prediction(self, request: PredictionRequest) -> Tuple[Optional[int], float, List[int], Dict]:
         """
-        Calculate predicted number using physics model
-        Returns: (predicted_number, confidence, debug_info)
+        Calculate predicted number using corrected physics model
+        Returns: (predicted_number, confidence, predicted_sector, debug_info)
         """
-        # Convert to physical units
-        pockets_per_second = request.traveled_pockets / (request.speed_ms_total / 1000.0)
-        angular_velocity = pockets_per_second * (2 * math.pi / 37)  # rad/s
-        
-        # Get calibrated friction for this position
-        friction = self.get_friction_coefficient(request.pos_x, request.pos_y)
-        
-        # Calculate deceleration (simplified model)
-        deceleration = (friction * Config.GRAVITY) / Config.WHEEL_RADIUS
-        
-        # Add air resistance (proportional to velocity squared)
-        air_drag = Config.AIR_RESISTANCE_COEFF * angular_velocity ** 2
-        total_deceleration = deceleration + air_drag
-        
-        # Time until critical velocity
-        if angular_velocity <= Config.CRITICAL_VELOCITY:
-            return None, 0.0, {"error": "Initial velocity too low"}
-        
-        time_to_drop = (angular_velocity - Config.CRITICAL_VELOCITY) / total_deceleration
-        
-        # Distance traveled (in radians)
-        distance_rad = (angular_velocity * time_to_drop - 
-                       0.5 * total_deceleration * time_to_drop ** 2)
-        
-        # Convert to pockets
-        pockets_to_travel = int((distance_rad * 37) / (2 * math.pi))
-        
-        # Account for wheel direction
-        if request.direction == "CCW":
-            pockets_to_travel = -pockets_to_travel
-        
-        # Calculate predicted number
-        predicted_number = WheelPhysics.get_number_at_distance(
-            request.number_at_t2,
-            pockets_to_travel,
-            request.direction
-        )
-        
-        # Calculate confidence based on calibration quality
-        confidence = self.calculate_confidence(request.pos_x, request.pos_y, friction)
-        
-        debug_info = {
-            "angular_velocity": round(angular_velocity, 3),
-            "friction": round(friction, 5),
-            "deceleration": round(total_deceleration, 3),
-            "time_to_drop": round(time_to_drop, 2),
-            "pockets_to_travel": pockets_to_travel
-        }
-        
-        return predicted_number, confidence, debug_info
+        try:
+            # 1. Calculate absolute ball velocities (rad/s)
+            omega_ball_t2 = (2 * math.pi) / (request.lap1_ms / 1000.0)
+            omega_ball_t3 = (2 * math.pi) / (request.lap2_ms / 1000.0)
+            
+            # 2. Calculate ball deceleration
+            time_between_measurements = request.lap2_ms / 1000.0
+            ball_deceleration = (omega_ball_t3 - omega_ball_t2) / time_between_measurements
+            
+            # Validate deceleration
+            if ball_deceleration >= -Config.MIN_DECELERATION:
+                return None, 0.0, [], {"error": "Insufficient deceleration", "decel": round(ball_deceleration, 3)}
+            
+            # 3. Calculate rotor velocity
+            rotor_pockets_per_sec = request.rotor_shift / (request.lap1_ms / 1000.0)
+            omega_rotor = (2 * math.pi / 37) * rotor_pockets_per_sec
+            
+            # Apply rotor direction
+            if request.rotor_direction == "CCW":
+                omega_rotor = -omega_rotor
+            
+            # 4. Time to critical velocity (when ball drops)
+            if omega_ball_t3 <= Config.CRITICAL_VELOCITY:
+                return None, 0.0, [], {"error": "Already below critical velocity"}
+            
+            time_to_drop = (omega_ball_t3 - Config.CRITICAL_VELOCITY) / (-ball_deceleration)
+            
+            if time_to_drop > Config.MAX_TIME_TO_DROP:
+                return None, 0.0, [], {"error": "Time to drop too large", "ttd": round(time_to_drop, 2)}
+            
+            # 5. Calculate ball position at drop (in radians)
+            ball_angle_traveled = (omega_ball_t3 * time_to_drop + 
+                                 0.5 * ball_deceleration * time_to_drop ** 2)
+            
+            # 6. Calculate rotor position at drop
+            rotor_angle_traveled = omega_rotor * time_to_drop
+            
+            # 7. Relative position (ball - rotor) in radians
+            relative_angle = ball_angle_traveled - rotor_angle_traveled
+            
+            # 8. Convert to pockets
+            pockets_offset = relative_angle * 37 / (2 * math.pi)
+            
+            # Account for phase within pocket at T2
+            pockets_offset += request.phase_at_t2
+            
+            # Round to get discrete pocket offset
+            pockets_offset_int = int(round(pockets_offset))
+            
+            # 9. Calculate predicted number
+            predicted_number = WheelPhysics.get_number_at_distance(
+                request.number_at_t3,
+                pockets_offset_int,
+                request.direction
+            )
+            
+            # 10. Calculate confidence based on measurement quality
+            confidence = self.calculate_confidence(
+                ball_deceleration,
+                time_to_drop,
+                request.lap1_ms,
+                request.lap2_ms
+            )
+            
+            # 11. Get predicted sector (with scatter model)
+            predicted_sector = self.get_predicted_sector(
+                predicted_number,
+                request.pos_x,
+                request.pos_y
+            )
+            
+            debug_info = {
+                "omega_ball_t2": round(omega_ball_t2, 3),
+                "omega_ball_t3": round(omega_ball_t3, 3),
+                "deceleration": round(ball_deceleration, 3),
+                "omega_rotor": round(omega_rotor, 3),
+                "time_to_drop": round(time_to_drop, 2),
+                "pockets_offset": round(pockets_offset, 2),
+                "phase_contribution": round(request.phase_at_t2, 3)
+            }
+            
+            return predicted_number, confidence, predicted_sector, debug_info
+            
+        except Exception as e:
+            logger.error(f"Physics calculation error: {e}")
+            return None, 0.0, [], {"error": str(e)}
     
-    def get_friction_coefficient(self, x: float, y: float) -> float:
-        """Get calibrated friction coefficient for position"""
-        # Create position key
-        grid_x = round(x / Config.POSITION_CELL_SIZE) * Config.POSITION_CELL_SIZE
-        grid_y = round(y / Config.POSITION_CELL_SIZE) * Config.POSITION_CELL_SIZE
+    def calculate_confidence(self, deceleration: float, time_to_drop: float, 
+                           lap1_ms: int, lap2_ms: int) -> float:
+        """Calculate confidence based on measurement quality"""
+        confidence = 0.5  # Base confidence
+        
+        # Deceleration stability
+        if -2.0 < deceleration < -0.3:
+            confidence += 0.2
+        
+        # Time to drop reasonableness
+        if 0.5 < time_to_drop < 5.0:
+            confidence += 0.1
+        
+        # Lap time consistency
+        lap_ratio = lap2_ms / lap1_ms
+        if 1.05 < lap_ratio < 1.5:  # Ball should be slowing down
+            confidence += 0.1
+        
+        # Cap confidence
+        return min(0.8, max(0.3, confidence))
+    
+    def get_predicted_sector(self, center_number: int, pos_x: float, pos_y: float) -> List[int]:
+        """Get sector of numbers accounting for scatter"""
+        # Get scatter model for this position
+        scatter_data = self.get_scatter_distribution(pos_x, pos_y)
+        
+        # Default sector size
+        sector_size = Config.SECTOR_SIZE
+        
+        # Adjust based on scatter data if available
+        if scatter_data and len(scatter_data) > 10:
+            # Calculate standard deviation of scatter
+            scatter_std = np.std([d['offset'] for d in scatter_data])
+            # Adjust sector size based on scatter
+            sector_size = min(13, max(7, int(2 * scatter_std + 1)))
+        
+        return WheelPhysics.get_sector(center_number, sector_size)
+    
+    def get_scatter_distribution(self, pos_x: float, pos_y: float) -> List[Dict]:
+        """Get historical scatter data for position"""
+        # Grid position
+        grid_x = round(pos_x / 50) * 50
+        grid_y = round(pos_y / 50) * 50
         pos_key = (grid_x, grid_y)
         
-        if pos_key in self.friction_map:
-            return self.friction_map[pos_key]
-        
-        return Config.BASE_FRICTION_COEFF
+        return self.scatter_models.get(pos_key, [])
     
-    def update_calibration(self, request_data: dict, actual_offset: int):
-        """Update friction map based on actual results"""
-        # Calculate what friction would have given correct result
-        actual_pockets = actual_offset
-        speed_ms = request_data['speed_ms_total']
-        traveled = request_data['traveled_pockets']
+    def update_scatter_model(self, request_data: dict, predicted_offset: int, actual_offset: int):
+        """Update scatter model with actual results"""
+        scatter = actual_offset - predicted_offset
         
-        # Initial angular velocity
-        pockets_per_sec = traveled / (speed_ms / 1000.0)
-        angular_vel = pockets_per_sec * (2 * math.pi / 37)
+        grid_x = round(request_data['pos_x'] / 50) * 50
+        grid_y = round(request_data['pos_y'] / 50) * 50
+        pos_key = (grid_x, grid_y)
         
-        # Skip if velocity too low
-        if angular_vel <= Config.CRITICAL_VELOCITY:
-            return
-        
-        # Back-calculate required deceleration
-        # Using simplified model: d = v*t - 0.5*a*t²
-        # We know d (actual_pockets converted to radians)
-        distance_rad = (actual_pockets * 2 * math.pi) / 37
-        
-        # Quadratic formula to find time
-        # 0.5*a*t² - v*t + d = 0
-        # This is approximate - real physics is more complex
-        
-        pos_key = (
-            round(request_data['pos_x'] / Config.POSITION_CELL_SIZE) * Config.POSITION_CELL_SIZE,
-            round(request_data['pos_y'] / Config.POSITION_CELL_SIZE) * Config.POSITION_CELL_SIZE
-        )
-        
-        # Store calibration data
-        self.calibration_data[pos_key].append({
-            'velocity': angular_vel,
-            'actual_pockets': actual_pockets,
+        self.scatter_models[pos_key].append({
+            'offset': scatter,
             'timestamp': datetime.now()
         })
         
-        # Update friction map with weighted average of recent data
-        if len(self.calibration_data[pos_key]) >= 3:
-            self.recalculate_friction(pos_key)
-    
-    def recalculate_friction(self, pos_key: Tuple[float, float]):
-        """Recalculate friction coefficient from calibration data"""
-        recent_data = self.calibration_data[pos_key][-20:]  # Last 20 spins
-        
-        if not recent_data:
-            return
-        
-        # Simple average for now - could use more sophisticated methods
-        friction_estimates = []
-        
-        for data in recent_data:
-            # Simplified back-calculation
-            # In reality, would solve the differential equation properly
-            est_friction = Config.BASE_FRICTION_COEFF * (1 + data['actual_pockets'] / 100)
-            friction_estimates.append(est_friction)
-        
-        # Update friction map
-        self.friction_map[pos_key] = sum(friction_estimates) / len(friction_estimates)
-        
-        # Limit friction to reasonable range
-        self.friction_map[pos_key] = max(0.01, min(0.1, self.friction_map[pos_key]))
-    
-    def calculate_confidence(self, x: float, y: float, friction: float) -> float:
-        """Calculate confidence based on calibration quality"""
-        pos_key = (
-            round(x / Config.POSITION_CELL_SIZE) * Config.POSITION_CELL_SIZE,
-            round(y / Config.POSITION_CELL_SIZE) * Config.POSITION_CELL_SIZE
-        )
-        
-        # Base confidence
-        confidence = 0.3
-        
-        # Increase if we have calibration data
-        if pos_key in self.calibration_data:
-            data_points = len(self.calibration_data[pos_key])
-            if data_points >= 10:
-                confidence = 0.5
-            if data_points >= 20:
-                confidence = 0.6
-            
-            # Check consistency of recent predictions
-            if data_points >= 5:
-                recent = self.calibration_data[pos_key][-5:]
-                variance = self.calculate_variance(recent)
-                if variance < 5:  # Low variance = high consistency
-                    confidence += 0.1
-        
-        return min(0.7, confidence)  # Cap at 70%
-    
-    def calculate_variance(self, data_points: List[Dict]) -> float:
-        """Calculate variance in actual pockets for consistency check"""
-        if len(data_points) < 2:
-            return 100.0
-        
-        pockets = [d['actual_pockets'] for d in data_points]
-        mean = sum(pockets) / len(pockets)
-        variance = sum((p - mean) ** 2 for p in pockets) / len(pockets)
-        
-        return variance
+        # Keep only recent data
+        if len(self.scatter_models[pos_key]) > 100:
+            self.scatter_models[pos_key] = self.scatter_models[pos_key][-100:]
 
 # ============================================================================
 # WHEEL PHYSICS
@@ -354,7 +336,7 @@ class WheelPhysics:
         return Config.WHEEL_LAYOUT[target_idx]
     
     @staticmethod
-    def get_sector(center_number: int, size: int = 8) -> List[int]:
+    def get_sector(center_number: int, size: int = 9) -> List[int]:
         """Get sector of numbers around center"""
         center_idx = Config.POCKET_TO_INDEX.get(center_number, 0)
         sector = []
@@ -367,16 +349,15 @@ class WheelPhysics:
         return sector
 
 # ============================================================================
-# HYBRID STORAGE SYSTEM
+# ENHANCED STORAGE SYSTEM
 # ============================================================================
 
-class HybridStorage:
-    """Combined pattern matching and physics calibration storage"""
+class EnhancedStorage:
+    """Storage system for three-point measurement data"""
     
     def __init__(self):
         self.data_path = self._get_data_path()
         self.pending_rounds = {}
-        self.pattern_database = defaultdict(list)
         self.physics_engine = PhysicsEngine()
         self.total_records = 0
         self.predictions_made = {}
@@ -388,8 +369,8 @@ class HybridStorage:
         """Determine optimal data storage location"""
         candidates = [
             os.getenv("ROULETTE_DATA_PATH", ""),
-            os.path.expanduser("~/.roulette_physics/database.csv"),
-            "./roulette_physics_database.csv"
+            os.path.expanduser("~/.roulette_enhanced/database.csv"),
+            "./roulette_enhanced_database.csv"
         ]
         
         for path in candidates:
@@ -419,267 +400,100 @@ class HybridStorage:
             logger.info("Initialized new database")
     
     def _load_existing_data(self):
-        """Load historical data for both pattern matching and physics calibration"""
+        """Load historical data for scatter model training"""
         if not os.path.exists(self.data_path):
             return
             
         try:
             cutoff_date = datetime.now() - timedelta(days=Config.DATA_RETENTION_DAYS)
+            loaded = 0
             
             with open(self.data_path, 'r', encoding='utf-8') as f:
                 reader = csv.DictReader(f)
-                loaded = 0
                 
                 for row in reader:
-                    if not all(k in row for k in ['pos_x', 'pos_y', 'speed_ms', 'direction', 'offset_from_t2', 'timestamp']):
-                        continue
-                    
                     try:
                         row_timestamp = datetime.fromisoformat(row['timestamp'])
                         if row_timestamp < cutoff_date:
                             continue
                         
-                        x = float(row['pos_x'])
-                        y = float(row['pos_y'])
-                        speed = int(row['speed_ms'])
-                        direction = row['direction']
-                        offset = int(row['offset_from_t2'])
-                        
-                        if direction not in Config.VALID_DIRECTIONS:
-                            continue
-                        
-                        # Add to pattern database
-                        cell_key = self._get_cell_key(x, y, speed, direction)
-                        pattern_data = {
-                            'offset': offset,
-                            'timestamp': row['timestamp'],
-                            'traveled_pockets': int(row.get('traveled_pockets', 7))
-                        }
-                        self.pattern_database[cell_key].append(pattern_data)
-                        
-                        # Update physics calibration
-                        if 'winning_number' in row and row['winning_number']:
-                            self.physics_engine.update_calibration(
-                                {
-                                    'pos_x': x,
-                                    'pos_y': y,
-                                    'speed_ms_total': speed,
-                                    'traveled_pockets': int(row.get('traveled_pockets', 7))
-                                },
-                                offset
+                        # Update scatter model if we have prediction and result
+                        if all(k in row and row[k] for k in ['predicted_physics', 'winning_number', 'number_t3']):
+                            predicted_num = int(row['predicted_physics'])
+                            winning_num = int(row['winning_number'])
+                            t3_num = int(row['number_t3'])
+                            
+                            predicted_offset = WheelPhysics.calculate_pocket_distance(
+                                t3_num, predicted_num, row['ball_direction']
+                            )
+                            actual_offset = WheelPhysics.calculate_pocket_distance(
+                                t3_num, winning_num, row['ball_direction']
+                            )
+                            
+                            self.physics_engine.update_scatter_model(
+                                {'pos_x': float(row['pos_x']), 'pos_y': float(row['pos_y'])},
+                                predicted_offset,
+                                actual_offset
                             )
                         
                         loaded += 1
                         
-                        # Enforce cell limit
-                        if len(self.pattern_database[cell_key]) > Config.MAX_RECORDS_PER_CELL:
-                            self.pattern_database[cell_key] = self.pattern_database[cell_key][-Config.MAX_RECORDS_PER_CELL:]
-                    
                     except (ValueError, KeyError) as e:
                         continue
-                
-                self.total_records = loaded
-                logger.info(f"Loaded {loaded} records into {len(self.pattern_database)} grid cells")
-                logger.info(f"Physics calibration data for {len(self.physics_engine.friction_map)} positions")
-                
+            
+            self.total_records = loaded
+            logger.info(f"Loaded {loaded} records for scatter model training")
+            
         except Exception as e:
             logger.error(f"Error loading database: {e}")
     
-    def _get_cell_key(self, x: float, y: float, speed: int, direction: str) -> Tuple:
-        """Convert position and speed to grid cell coordinates"""
-        x_cell = round(x / Config.POSITION_CELL_SIZE) * Config.POSITION_CELL_SIZE
-        y_cell = round(y / Config.POSITION_CELL_SIZE) * Config.POSITION_CELL_SIZE
-        speed_cell = round(speed / Config.SPEED_CELL_SIZE) * Config.SPEED_CELL_SIZE
-        return (x_cell, y_cell, speed_cell, direction)
-    
     def store_pending(self, request: PredictionRequest) -> bool:
         """Store round data temporarily until winning number arrives"""
-        # Clear old pending rounds if new data arrives
-        if self.pending_rounds:
-            old_count = len(self.pending_rounds)
-            self.pending_rounds.clear()
-            self.predictions_made.clear()
-            logger.info(f"Cleared {old_count} pending rounds - new round data received")
-        
         # Store pending data
         self.pending_rounds[request.round_id] = {
             'timestamp': datetime.now(),
             'data': request.dict(),
             'physics_prediction': None,
-            'pattern_prediction': None
+            'physics_confidence': None,
+            'predicted_sector': None
         }
         
-        logger.info(f"Stored pending round {request.round_id}")
+        logger.info(f"Stored pending round {request.round_id} with three-point data")
         return True
     
-    def get_hybrid_prediction(self, request: PredictionRequest) -> Dict[str, Any]:
-        """Get prediction using both physics and pattern matching"""
+    def get_prediction(self, request: PredictionRequest) -> Dict[str, Any]:
+        """Get prediction using enhanced physics"""
         
-        # 1. Physics-based prediction
-        physics_number, physics_confidence, debug_info = self.physics_engine.calculate_prediction(request)
+        # Physics-based prediction
+        physics_number, confidence, predicted_sector, debug_info = self.physics_engine.calculate_prediction(request)
         
-        # 2. Pattern-based prediction (existing method)
-        pattern_number, pattern_confidence, matches = self.find_pattern_matches(request)
-        
-        # 3. Combine predictions
-        if physics_number is not None and pattern_number is not None:
-            # Both methods have predictions
-            if physics_number == pattern_number:
-                # Strong agreement
-                final_number = physics_number
-                final_confidence = min(0.8, physics_confidence + pattern_confidence)
-                method = "both_agree"
-            else:
-                # Disagreement - use weighted average based on confidence
-                if physics_confidence > pattern_confidence:
-                    final_number = physics_number
-                    final_confidence = physics_confidence
-                    method = "physics_preferred"
-                else:
-                    final_number = pattern_number
-                    final_confidence = pattern_confidence
-                    method = "pattern_preferred"
-        elif physics_number is not None:
-            # Only physics has prediction
-            final_number = physics_number
-            final_confidence = physics_confidence
-            method = "physics_only"
-        elif pattern_number is not None:
-            # Only pattern has prediction
-            final_number = pattern_number
-            final_confidence = pattern_confidence
-            method = "pattern_only"
-        else:
-            # No prediction
-            final_number = None
-            final_confidence = 0.0
-            method = "none"
-        
-        # Store predictions for accuracy tracking
-        if final_number is not None:
+        # Store prediction for accuracy tracking
+        if physics_number is not None and confidence >= Config.MIN_CONFIDENCE_THRESHOLD:
             self.predictions_made[request.round_id] = {
                 'physics': physics_number,
-                'pattern': pattern_number,
-                'final': final_number,
-                'method': method
+                'confidence': confidence,
+                'sector': predicted_sector
             }
+            
+            # Update pending round
+            if request.round_id in self.pending_rounds:
+                self.pending_rounds[request.round_id]['physics_prediction'] = physics_number
+                self.pending_rounds[request.round_id]['physics_confidence'] = confidence
+                self.pending_rounds[request.round_id]['predicted_sector'] = predicted_sector
         
         return {
-            'predicted_number': final_number,
-            'confidence': round(final_confidence, 3),
-            'method': method,
+            'predicted_number': physics_number if confidence >= Config.MIN_CONFIDENCE_THRESHOLD else None,
+            'confidence': round(confidence, 3),
+            'predicted_sector': predicted_sector if physics_number else [],
+            'dataset_rows': self.total_records,
             'physics': {
-                'number': physics_number,
-                'confidence': round(physics_confidence, 3) if physics_confidence else 0,
+                'confidence': round(confidence, 3),
                 'debug': debug_info
-            },
-            'pattern': {
-                'number': pattern_number,
-                'confidence': round(pattern_confidence, 3) if pattern_confidence else 0,
-                'matches': matches
-            },
-            'dataset_rows': self.total_records
+            }
         }
     
-    def find_pattern_matches(self, request: PredictionRequest) -> Tuple[Optional[int], float, int]:
-        """Find matching patterns (existing method improved)"""
-        cell_key = self._get_cell_key(
-            request.pos_x,
-            request.pos_y,
-            request.speed_ms_total,
-            request.direction
-        )
-        
-        # Collect matches with tighter criteria
-        offset_weights = defaultdict(float)
-        total_matches = 0
-        
-        # Search in smaller radius for better precision
-        for radius in range(2):  # Only 0 and 1
-            cells_to_check = self._get_neighbor_cells(cell_key, radius)
-            
-            for check_cell in cells_to_check:
-                if check_cell in self.pattern_database:
-                    for pattern in self.pattern_database[check_cell]:
-                        # Filter by traveled pockets similarity
-                        if abs(pattern.get('traveled_pockets', 7) - request.traveled_pockets) > 1:
-                            continue
-                        
-                        offset = pattern['offset']
-                        weight = 1.0 / (1 + radius)
-                        offset_weights[offset] += weight
-                        total_matches += 1
-        
-        if total_matches < Config.MIN_MATCHES_FOR_PREDICTION:
-            return None, 0.0, total_matches
-        
-        if not offset_weights:
-            return None, 0.0, 0
-        
-        # Get the offset with highest weight
-        best_offset = max(offset_weights.items(), key=lambda x: x[1])[0]
-        
-        # Convert offset to predicted number
-        predicted_number = WheelPhysics.get_number_at_distance(
-            request.number_at_t2,
-            best_offset,
-            request.direction
-        )
-        
-        # Calculate confidence
-        confidence = self._calculate_pattern_confidence(offset_weights, total_matches)
-        
-        return predicted_number, confidence, total_matches
-    
-    def _get_neighbor_cells(self, center_cell: Tuple, radius: int) -> List[Tuple]:
-        """Get neighboring grid cells at specified radius"""
-        if radius == 0:
-            return [center_cell]
-        
-        x, y, speed, direction = center_cell
-        neighbors = []
-        
-        for dx in [-radius, 0, radius]:
-            for dy in [-radius, 0, radius]:
-                for ds in [-radius, 0, radius]:
-                    if max(abs(dx), abs(dy), abs(ds)) == radius:
-                        neighbor = (
-                            x + dx * Config.POSITION_CELL_SIZE,
-                            y + dy * Config.POSITION_CELL_SIZE,
-                            speed + ds * Config.SPEED_CELL_SIZE,
-                            direction
-                        )
-                        neighbors.append(neighbor)
-        
-        return neighbors
-    
-    def _calculate_pattern_confidence(self, offset_weights: Dict[int, float], total_matches: int) -> float:
-        """Calculate confidence score based on pattern consistency"""
-        if total_matches < Config.MIN_MATCHES_FOR_PREDICTION:
-            return 0.0
-        
-        if not offset_weights:
-            return 0.0
-        
-        top_weight = max(offset_weights.values())
-        total_weight = sum(offset_weights.values())
-        
-        if total_weight == 0:
-            return 0.0
-            
-        consistency = top_weight / total_weight
-        
-        # Return confidence based on consistency and match count
-        base_confidence = 0.3
-        if consistency >= 0.7 and total_matches >= 10:
-            base_confidence = 0.5
-        elif consistency >= 0.6:
-            base_confidence = 0.4
-            
-        return base_confidence
-    
     def finalize_round(self, round_id: str, winning_number: int) -> Dict[str, Any]:
-        """Complete round with winning number and update both systems"""
+        """Complete round with winning number and update models"""
         if round_id not in self.pending_rounds:
             return {
                 "success": False,
@@ -689,33 +503,33 @@ class HybridStorage:
         pending = self.pending_rounds[round_id]
         round_data = pending['data']
         
-        # Calculate offset from T2 to winning number
+        # Calculate offset from T3 to winning number
         offset = WheelPhysics.calculate_pocket_distance(
-            round_data['number_at_t2'],
+            round_data['number_at_t3'],
             winning_number,
             round_data['direction']
         )
         
-        # Get prediction errors if we made predictions
+        # Calculate prediction error if we made a prediction
         physics_error = None
-        pattern_error = None
-        
-        if round_id in self.predictions_made:
-            pred = self.predictions_made[round_id]
+        if pending['physics_prediction'] is not None:
+            physics_error = WheelPhysics.calculate_pocket_distance(
+                pending['physics_prediction'],
+                winning_number,
+                round_data['direction']
+            )
             
-            if pred['physics'] is not None:
-                physics_error = WheelPhysics.calculate_pocket_distance(
-                    pred['physics'],
-                    winning_number,
-                    round_data['direction']
-                )
-            
-            if pred['pattern'] is not None:
-                pattern_error = WheelPhysics.calculate_pocket_distance(
-                    pred['pattern'],
-                    winning_number,
-                    round_data['direction']
-                )
+            # Update scatter model
+            predicted_offset = WheelPhysics.calculate_pocket_distance(
+                round_data['number_at_t3'],
+                pending['physics_prediction'],
+                round_data['direction']
+            )
+            self.physics_engine.update_scatter_model(
+                round_data,
+                predicted_offset,
+                offset
+            )
         
         # Prepare complete record
         complete_record = {
@@ -724,45 +538,25 @@ class HybridStorage:
             'table_id': round_data['table_id'],
             'pos_x': round_data['pos_x'],
             'pos_y': round_data['pos_y'],
-            'speed_ms': round_data['speed_ms_total'],
-            'traveled_pockets': round_data['traveled_pockets'],
-            'direction': round_data['direction'],
+            'lap1_ms': round_data['lap1_ms'],
+            'lap2_ms': round_data['lap2_ms'],
+            'rotor_shift': round_data['rotor_shift'],
+            'rotor_direction': round_data['rotor_direction'],
+            'ball_direction': round_data['direction'],
             'number_t1': round_data['number_at_t1'],
             'number_t2': round_data['number_at_t2'],
+            'number_t3': round_data['number_at_t3'],
+            'phase_t2': round_data['phase_at_t2'],
             'winning_number': winning_number,
-            'offset_from_t2': offset,
-            'predicted_physics': self.predictions_made.get(round_id, {}).get('physics'),
-            'predicted_pattern': self.predictions_made.get(round_id, {}).get('pattern'),
+            'offset_from_t3': offset,
+            'predicted_physics': pending['physics_prediction'],
+            'predicted_sector': json.dumps(pending['predicted_sector']) if pending['predicted_sector'] else None,
             'error_physics': physics_error,
-            'error_pattern': pattern_error
+            'confidence': pending['physics_confidence']
         }
         
         # Save to database
         self._save_to_csv(complete_record)
-        
-        # Update pattern database
-        cell_key = self._get_cell_key(
-            round_data['pos_x'],
-            round_data['pos_y'],
-            round_data['speed_ms_total'],
-            round_data['direction']
-        )
-        
-        pattern_data = {
-            'offset': offset,
-            'timestamp': complete_record['timestamp'],
-            'traveled_pockets': round_data['traveled_pockets']
-        }
-        
-        self.pattern_database[cell_key].append(pattern_data)
-        
-        # Update physics calibration
-        self.physics_engine.update_calibration(round_data, offset)
-        
-        # Enforce limits
-        if len(self.pattern_database[cell_key]) > Config.MAX_RECORDS_PER_CELL:
-            self.pattern_database[cell_key] = self.pattern_database[cell_key][-Config.MAX_RECORDS_PER_CELL:]
-        
         self.total_records += 1
         
         # Clean up
@@ -780,13 +574,10 @@ class HybridStorage:
         if physics_error is not None:
             response["physics_error"] = abs(physics_error)
             response["physics_accuracy"] = "accurate" if abs(physics_error) <= 4 else "needs_improvement"
-        
-        if pattern_error is not None:
-            response["pattern_error"] = abs(pattern_error)
-            response["pattern_accuracy"] = "accurate" if abs(pattern_error) <= 4 else "needs_improvement"
+            response["overall_accuracy"] = "accurate" if abs(physics_error) <= 4 else "improving"
         
         logger.info(f"Finalized round {round_id}: winning={winning_number}, "
-                   f"physics_error={physics_error}, pattern_error={pattern_error}")
+                   f"physics_error={physics_error}")
         
         return response
     
@@ -822,8 +613,8 @@ class HybridStorage:
 
 app = FastAPI(
     title="Enhanced Roulette Physics Server",
-    description="Hybrid physics and pattern matching prediction system",
-    version="3.0.0"
+    description="Three-point measurement prediction system with corrected physics",
+    version="5.0.0"
 )
 
 app.add_middleware(
@@ -835,42 +626,41 @@ app.add_middleware(
 )
 
 # Initialize storage
-storage = HybridStorage()
+storage = EnhancedStorage()
 
 @app.on_event("startup")
 async def startup_event():
     """Run maintenance tasks on server startup"""
     storage.cleanup_pending_rounds()
-    logger.info("Server started with hybrid physics + pattern matching engine")
+    logger.info("Server started with enhanced three-point measurement system")
+    logger.info(f"Total records: {storage.total_records}")
 
 @app.get("/")
 async def status():
     """Server status and statistics"""
     return {
         "server": "Enhanced Roulette Physics Server",
-        "version": "3.0.0",
+        "version": "5.0.0",
         "status": "operational",
-        "engine": "hybrid_physics_pattern",
+        "engine": "three_point_physics",
         "statistics": {
             "total_records": storage.total_records,
-            "pattern_cells": len(storage.pattern_database),
-            "physics_positions": len(storage.physics_engine.friction_map),
             "pending_rounds": len(storage.pending_rounds),
-            "active_predictions": len(storage.predictions_made)
+            "active_predictions": len(storage.predictions_made),
+            "scatter_positions": len(storage.physics_engine.scatter_models)
         },
         "configuration": {
-            "min_speed_ms": Config.MIN_BALL_SPEED_MS,
-            "max_speed_ms": Config.MAX_BALL_SPEED_MS,
-            "position_precision": Config.POSITION_CELL_SIZE,
-            "speed_precision": Config.SPEED_CELL_SIZE,
-            "physics_enabled": True,
-            "pattern_matching_enabled": True
+            "measurement_points": 3,
+            "physics_model": "absolute_velocity",
+            "scatter_modeling": True,
+            "sector_size": Config.SECTOR_SIZE,
+            "confidence_threshold": Config.MIN_CONFIDENCE_THRESHOLD
         }
     }
 
 @app.post("/predict")
 async def predict(request: PredictionRequest):
-    """Process prediction request using hybrid approach"""
+    """Process prediction request using enhanced physics"""
     try:
         # Validate and store pending round
         if not storage.store_pending(request):
@@ -881,42 +671,44 @@ async def predict(request: PredictionRequest):
                 "dataset_rows": storage.total_records
             }
         
-        # Get hybrid prediction
-        result = storage.get_hybrid_prediction(request)
+        # Get physics prediction
+        result = storage.get_prediction(request)
         
         # Format response
         if result['predicted_number'] is not None:
-            # Calculate predicted sector for better accuracy representation
-            sector = WheelPhysics.get_sector(result['predicted_number'], Config.SECTOR_SIZE)
-            
             response = {
                 "predicted_number": result['predicted_number'],
                 "confidence": result['confidence'],
-                "predicted_sector": sector,
-                "method": result['method'],
+                "predicted_sector": result['predicted_sector'],
                 "dataset_rows": result['dataset_rows'],
-                "physics_prediction": result['physics']['number'],
-                "pattern_prediction": result['pattern']['number'],
-                "matches_found": result['pattern']['matches']
+                "physics_confidence": result['physics']['confidence'],
+                "debug": result['physics']['debug']
             }
             
             # Add confidence assessment
-            if result['confidence'] >= 0.6:
+            if result['confidence'] >= 0.7:
                 response['confidence_level'] = "high"
-            elif result['confidence'] >= 0.4:
+                response['recommendation'] = f"Bet on sector: {result['predicted_sector']}"
+            elif result['confidence'] >= 0.5:
                 response['confidence_level'] = "medium"
+                response['recommendation'] = f"Consider sector: {result['predicted_sector']}"
             else:
                 response['confidence_level'] = "low"
+                response['recommendation'] = "No bet - insufficient confidence"
+            
+            logger.info(f"Prediction for round {request.round_id}: "
+                       f"Number={result['predicted_number']}, "
+                       f"Confidence={result['confidence']}")
             
             return response
         else:
+            reason = result['physics']['debug'].get('error', 'Insufficient confidence')
             return {
                 "predicted_number": None,
                 "confidence": 0,
-                "error": "Insufficient data for prediction",
+                "error": f"No prediction: {reason}",
                 "dataset_rows": result['dataset_rows'],
-                "matches_found": result['pattern']['matches'],
-                "physics_status": "calculating" if storage.total_records < 100 else "ready"
+                "debug": result['physics']['debug']
             }
     
     except Exception as e:
@@ -941,16 +733,10 @@ async def log_winner(request: WinnerRequest):
             if "physics_error" in result:
                 response["physics_error"] = result["physics_error"]
                 response["physics_accuracy"] = result["physics_accuracy"]
+                response["overall_accuracy"] = result["overall_accuracy"]
             
-            if "pattern_error" in result:
-                response["pattern_error"] = result["pattern_error"]
-                response["pattern_accuracy"] = result["pattern_accuracy"]
-            
-            # Overall accuracy assessment
-            if "physics_error" in result and "pattern_error" in result:
-                avg_error = (result["physics_error"] + result["pattern_error"]) / 2
-                response["average_error"] = round(avg_error, 1)
-                response["overall_accuracy"] = "accurate" if avg_error <= 4 else "improving"
+            logger.info(f"Winner logged for round {request.round_id}: "
+                       f"Number={request.winning_number}")
             
             return response
         else:
@@ -967,46 +753,50 @@ async def log_winner(request: WinnerRequest):
 @app.get("/statistics")
 async def statistics():
     """Detailed system statistics"""
-    # Calculate physics calibration coverage
-    physics_coverage = len(storage.physics_engine.friction_map)
-    
-    # Get accuracy statistics from recent predictions
-    recent_errors_physics = []
-    recent_errors_pattern = []
-    
-    # This would need to be implemented to track recent prediction errors
+    scatter_stats = {}
+    for pos_key, scatter_data in storage.physics_engine.scatter_models.items():
+        if scatter_data:
+            offsets = [d['offset'] for d in scatter_data]
+            scatter_stats[f"{pos_key[0]},{pos_key[1]}"] = {
+                "samples": len(scatter_data),
+                "mean_scatter": round(np.mean(offsets), 2),
+                "std_scatter": round(np.std(offsets), 2)
+            }
     
     return {
         "total_records": storage.total_records,
-        "pattern_cells": len(storage.pattern_database),
-        "physics_calibrated_positions": physics_coverage,
         "pending_rounds": len(storage.pending_rounds),
-        "predictions_tracking": len(storage.predictions_made),
+        "active_predictions": len(storage.predictions_made),
         "database_path": storage.data_path,
-        "engine_type": "hybrid_physics_pattern",
+        "engine_type": "three_point_physics",
+        "scatter_models": scatter_stats,
         "physics_constants": {
-            "wheel_radius": Config.WHEEL_RADIUS,
             "critical_velocity": Config.CRITICAL_VELOCITY,
-            "base_friction": Config.BASE_FRICTION_COEFF
+            "min_deceleration": Config.MIN_DECELERATION,
+            "sector_size": Config.SECTOR_SIZE
         }
     }
 
 @app.get("/calibration/{table_id}")
 async def get_calibration(table_id: str = "default"):
-    """Get physics calibration data for specific table"""
-    friction_data = {}
+    """Get scatter calibration data for specific table"""
+    scatter_data = {}
     
-    for pos_key, friction in storage.physics_engine.friction_map.items():
-        key_str = f"{pos_key[0]},{pos_key[1]}"
-        friction_data[key_str] = {
-            "friction_coefficient": round(friction, 5),
-            "calibration_points": len(storage.physics_engine.calibration_data.get(pos_key, []))
-        }
+    for pos_key, data in storage.physics_engine.scatter_models.items():
+        if data:
+            key_str = f"{pos_key[0]},{pos_key[1]}"
+            offsets = [d['offset'] for d in data]
+            scatter_data[key_str] = {
+                "calibration_points": len(data),
+                "mean_scatter": round(np.mean(offsets), 2),
+                "std_scatter": round(np.std(offsets), 2),
+                "recommended_sector_size": min(13, max(7, int(2 * np.std(offsets) + 1)))
+            }
     
     return {
         "table_id": table_id,
-        "calibrated_positions": len(friction_data),
-        "friction_map": friction_data
+        "calibrated_positions": len(scatter_data),
+        "scatter_data": scatter_data
     }
 
 @app.delete("/clear_pending")
@@ -1020,12 +810,12 @@ async def clear_pending():
 if __name__ == "__main__":
     import uvicorn
     print("\n" + "="*70)
-    print("PHYSICS-ONLY ROULETTE PREDICTION SERVER v2.0.0")
-    print("Physics-based trajectory calculation engine")
+    print("ENHANCED ROULETTE PHYSICS SERVER v5.0.0")
+    print("Three-point measurement system with corrected physics")
     print("="*70)
     print(f"Database: {storage.data_path}")
     print(f"Records loaded: {storage.total_records}")
-    print(f"Physics positions: {len(storage.physics_engine.friction_map)}")
+    print(f"Scatter models: {len(storage.physics_engine.scatter_models)}")
     print("="*70 + "\n")
     
     uvicorn.run(app, host="0.0.0.0", port=8000, log_level="info")
