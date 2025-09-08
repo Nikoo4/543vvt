@@ -40,7 +40,8 @@ MAX_RECORDS = 100000
 # CSV columns
 CSV_COLUMNS = [
     'timestamp', 'round_id', 'ball_speed_ms', 'traveled_pockets',
-    'number_at_ts2', 'direction', 'winning_number', 'pockets_to_win'
+    'number_at_ts2', 'direction', 'winning_number', 'pockets_to_win',
+    'green_angle_ts1', 'green_angle_ts2', 'wheel_speed'  # NEW FIELDS
 ]
 
 # ============================================================================
@@ -55,6 +56,8 @@ class PredictionRequest(BaseModel):
     number_at_ts2: int = Field(..., ge=0, le=36, description="Number at second timestamp")
     direction: str = Field(..., pattern="^(CW|CCW)$", description="Ball direction")
     table_id: str = Field(default="auto_roulette")
+    green_angle_ts1: Optional[float] = Field(None, description="Green marker angle at TS1")  # NEW
+    green_angle_ts2: Optional[float] = Field(None, description="Green marker angle at TS2")  # NEW
 
 class WinnerRequest(BaseModel):
     """Log winning number for completed round"""
@@ -127,7 +130,7 @@ class PatternDatabase:
             logger.error(f"Error counting records: {e}")
             self.total_records = 0
     
-    def find_exact_match(self, ball_speed: int, traveled_pockets: int, direction: str) -> Optional[int]:
+    def find_exact_match(self, ball_speed: int, traveled_pockets: int, direction: str, wheel_speed: Optional[float]) -> Optional[int]:
         """
         Find EXACT match in database
         Returns pockets_to_win if found, None otherwise
@@ -140,7 +143,17 @@ class PatternDatabase:
                 reader = csv.DictReader(f)
                 
                 for row in reader:
-                    # Check for EXACT match (no ranges, no approximation)
+                    # If wheel speed data is available, use it for matching
+                    if wheel_speed is not None and row.get('wheel_speed'):
+                        try:
+                            row_wheel_speed = float(row['wheel_speed'])
+                            wheel_speed_diff = abs(row_wheel_speed - wheel_speed)
+                            if wheel_speed_diff > 10:  # 10 degrees tolerance
+                                continue
+                        except (ValueError, TypeError):
+                            pass
+                    
+                    # Check for EXACT match on other parameters
                     if (int(row['ball_speed_ms']) == ball_speed and
                         int(row['traveled_pockets']) == traveled_pockets and
                         row['direction'] == direction and
@@ -148,10 +161,13 @@ class PatternDatabase:
                         
                         logger.info(f"Found exact match: speed={ball_speed}, "
                                   f"traveled={traveled_pockets}, offset={row['pockets_to_win']}")
+                        if wheel_speed is not None:
+                            logger.info(f"Wheel speed matched within tolerance")
                         return int(row['pockets_to_win'])
                 
                 logger.info(f"No exact match found for: speed={ball_speed}, "
-                          f"traveled={traveled_pockets}, direction={direction}")
+                          f"traveled={traveled_pockets}, direction={direction}, "
+                          f"wheel_speed={wheel_speed}")
                 return None
                 
         except Exception as e:
@@ -160,14 +176,27 @@ class PatternDatabase:
     
     def store_pending(self, request: PredictionRequest):
         """Store round data temporarily until winning number arrives"""
+        
+        # Calculate wheel speed if both angles are provided
+        wheel_speed = None
+        if request.green_angle_ts1 is not None and request.green_angle_ts2 is not None:
+            angle_diff = request.green_angle_ts2 - request.green_angle_ts1
+            if angle_diff < 0:
+                angle_diff += 360
+            wheel_speed = angle_diff  # degrees traveled during ball_speed_ms time
+            logger.info(f"Calculated wheel speed: {wheel_speed:.1f} degrees in {request.ball_speed_ms}ms")
+        
         self.pending_rounds[request.round_id] = {
             'timestamp': datetime.now().isoformat(),
             'ball_speed_ms': request.ball_speed_ms,
             'traveled_pockets': request.traveled_pockets,
             'number_at_ts2': request.number_at_ts2,
-            'direction': request.direction
+            'direction': request.direction,
+            'green_angle_ts1': request.green_angle_ts1,
+            'green_angle_ts2': request.green_angle_ts2,
+            'wheel_speed': wheel_speed
         }
-        logger.info(f"Stored pending round: {request.round_id}")
+        logger.info(f"Stored pending round: {request.round_id}, wheel_speed: {wheel_speed}")
     
     def complete_round(self, round_id: str, winning_number: int) -> Dict[str, Any]:
         """Complete round with winning number and save to database"""
@@ -196,7 +225,10 @@ class PatternDatabase:
             'number_at_ts2': pending['number_at_ts2'],
             'direction': pending['direction'],
             'winning_number': winning_number,
-            'pockets_to_win': pockets_to_win
+            'pockets_to_win': pockets_to_win,
+            'green_angle_ts1': pending['green_angle_ts1'],
+            'green_angle_ts2': pending['green_angle_ts2'],
+            'wheel_speed': pending['wheel_speed']
         }
         
         # Save to CSV
@@ -230,11 +262,20 @@ class PatternDatabase:
         # First, store the pending round
         self.store_pending(request)
         
+        # Calculate wheel speed for matching
+        wheel_speed = None
+        if request.green_angle_ts1 is not None and request.green_angle_ts2 is not None:
+            angle_diff = request.green_angle_ts2 - request.green_angle_ts1
+            if angle_diff < 0:
+                angle_diff += 360
+            wheel_speed = angle_diff
+        
         # Look for exact match in database
         offset = self.find_exact_match(
             request.ball_speed_ms,
             request.traveled_pockets,
-            request.direction
+            request.direction,
+            wheel_speed
         )
         
         if offset is not None:
