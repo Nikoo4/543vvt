@@ -1,6 +1,6 @@
 """
-Simple Roulette Prediction Server - Enhanced with TS3
-Based on exact pattern matching method for automated roulette
+Roulette Final Memory Server
+Direct final number prediction based on historical matches
 Version: 2.0.0
 """
 
@@ -10,6 +10,7 @@ import json
 import logging
 from datetime import datetime
 from typing import Dict, Any, Optional, List
+from collections import Counter, defaultdict
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -34,21 +35,19 @@ EUROPEAN_WHEEL = [
 ]
 
 # Database configuration
-DATABASE_FILE = "roulette_patterns_v2.csv"
-MAX_RECORDS = 100000
+DATABASE_FILE = "roulette_patterns.csv"
 
-# CSV columns - Enhanced with TS3 data and rotor direction
+# CSV columns with new fields
 CSV_COLUMNS = [
-    'timestamp', 'round_id', 
-    'ball_speed_ms', 'period1_ms', 'period2_ms', 'deceleration',
-    'traveled_pockets', 'number_at_ts2', 'number_at_ts3', 
-    'direction', 'winning_number', 'pockets_to_win',
-    'green_angle_ts1', 'green_angle_ts2', 'green_angle_ts3', 
-    'wheel_speed', 'rotor_direction'  # CHANGE 1: Added rotor_direction
+    'timestamp', 'round_id', 'table_id', 'ball_speed_ms', 'traveled_pockets',
+    'number_at_ts2', 'direction', 'winning_number', 'pockets_to_win',
+    'green_angle_ts1', 'green_angle_ts2', 'wheel_speed'
 ]
 
-# Matching tolerances
-wheel_speed_tolerance = 5  # degrees tolerance for wheel speed matching
+# Tolerance settings (EXACT matching)
+MS_TOLERANCE = 0  # Exact speed match
+POCKETS_TOLERANCE = 0  # Exact pockets match
+ANGLE_TOLERANCE = 1.0  # Maximum 1 degree tolerance
 
 # ============================================================================
 # DATA MODELS
@@ -58,18 +57,12 @@ class PredictionRequest(BaseModel):
     """Request for prediction based on ball measurements"""
     round_id: str = Field(..., min_length=5, max_length=50)
     ball_speed_ms: int = Field(..., ge=200, le=10000, description="Ball rotation time in ms")
-    period1_ms: Optional[int] = Field(None, description="Time between TS1 and TS2")
-    period2_ms: Optional[int] = Field(None, description="Time between TS2 and TS3")
-    deceleration: Optional[int] = Field(None, description="Ball deceleration (period2 - period1)")
     traveled_pockets: int = Field(..., ge=0, le=37, description="Pockets traveled between timestamps")
     number_at_ts2: int = Field(..., ge=0, le=36, description="Number at second timestamp")
-    number_at_ts3: Optional[int] = Field(None, ge=0, le=36, description="Number at third timestamp")
     direction: str = Field(..., pattern="^(CW|CCW)$", description="Ball direction")
     table_id: str = Field(default="auto_roulette")
     green_angle_ts1: Optional[float] = Field(None, description="Green marker angle at TS1")
     green_angle_ts2: Optional[float] = Field(None, description="Green marker angle at TS2")
-    green_angle_ts3: Optional[float] = Field(None, description="Green marker angle at TS3")
-    rotor_direction: Optional[str] = Field(None, pattern="^(CW|CCW)$", description="Rotor direction")  # CHANGE 2: Added field
 
 class WinnerRequest(BaseModel):
     """Log winning number for completed round"""
@@ -95,26 +88,19 @@ def calculate_pocket_distance(from_number: int, to_number: int, direction: str) 
     
     return distance
 
-def get_number_at_distance(from_number: int, distance: int, direction: str) -> int:
-    """Get number at specified distance from reference number"""
-    try:
-        from_idx = EUROPEAN_WHEEL.index(from_number)
-    except ValueError:
-        return from_number
-    
-    if direction == "CW":
-        target_idx = (from_idx + distance) % 37
-    else:  # CCW
-        target_idx = (from_idx - distance) % 37
-    
-    return EUROPEAN_WHEEL[target_idx]
+def circular_angle_difference(angle1: float, angle2: float) -> float:
+    """Calculate minimum angular difference in degrees (0-180)"""
+    diff = abs(angle1 - angle2)
+    if diff > 180:
+        diff = 360 - diff
+    return diff
 
 # ============================================================================
 # DATABASE MANAGER
 # ============================================================================
 
 class PatternDatabase:
-    """Manages pattern storage and matching"""
+    """Manages pattern storage and matching with final memory approach"""
     
     def __init__(self):
         self.pending_rounds = {}  # Temporary storage for rounds awaiting results
@@ -142,96 +128,82 @@ class PatternDatabase:
             logger.error(f"Error counting records: {e}")
             self.total_records = 0
     
-    def find_exact_match(self, request: PredictionRequest, wheel_speed: Optional[float]) -> Optional[int]:
+    def find_final_matches(self, ball_speed: int, traveled_pockets: int, 
+                          direction: str, green_angle_ts2: Optional[float], 
+                          table_id: str) -> List[int]:
         """
-        Find EXACT match in database with TS3 data if available
-        Returns pockets_to_win if found, None otherwise
+        Find ALL matches and return list of winning numbers
+        Uses EXACT matching with optional 1 degree tolerance for angle
         """
         if not os.path.exists(DATABASE_FILE):
-            return None
+            return []
         
-        # Determine which reference number to use based on TS3 availability
-        reference_number = request.number_at_ts3 if request.number_at_ts3 is not None else request.number_at_ts2
+        winning_numbers = []
         
         try:
             with open(DATABASE_FILE, 'r', encoding='utf-8') as f:
                 reader = csv.DictReader(f)
                 
                 for row in reader:
-                    # Check for EXACT match on primary parameters
-                    if (int(row['ball_speed_ms']) == request.ball_speed_ms and
-                        int(row['traveled_pockets']) == request.traveled_pockets and
-                        row['direction'] == request.direction and
-                        row.get('rotor_direction') == request.rotor_direction and  # CHANGE 3: Check rotor direction
-                        row['pockets_to_win']):  # Must have result
-                        
-                        # CHANGE 4: If wheel speed data is available, use percentage-based matching
-                        if wheel_speed is not None and row.get('wheel_speed'):
-                            try:
-                                row_wheel_speed = float(row['wheel_speed'])
-                                relative_diff = abs(row_wheel_speed - wheel_speed) / wheel_speed
-                                if relative_diff > 0.03:  # 3% tolerance
-                                    continue
-                            except (ValueError, TypeError, ZeroDivisionError):
+                    # Skip if different table
+                    if row.get('table_id') != table_id:
+                        continue
+                    
+                    # Check EXACT match on speed and pockets
+                    if (int(row['ball_speed_ms']) != ball_speed or
+                        int(row['traveled_pockets']) != traveled_pockets or
+                        row['direction'] != direction):
+                        continue
+                    
+                    # Check angle match if provided (1 degree tolerance)
+                    if green_angle_ts2 is not None and row.get('green_angle_ts2'):
+                        try:
+                            row_angle = float(row['green_angle_ts2'])
+                            angle_diff = circular_angle_difference(green_angle_ts2, row_angle)
+                            if angle_diff > ANGLE_TOLERANCE:
                                 continue
-                        
-                        # If we have TS3 data, also match on deceleration
-                        if request.deceleration is not None and row.get('deceleration'):
-                            try:
-                                row_decel = int(row['deceleration'])
-                                if abs(row_decel - request.deceleration) > 50:  # 50ms tolerance
-                                    continue
-                            except (ValueError, TypeError):
-                                pass
-                        
-                        logger.info(f"Found exact match: speed={request.ball_speed_ms}, "
-                                  f"traveled={request.traveled_pockets}, offset={row['pockets_to_win']}")
-                        if wheel_speed is not None:
-                            logger.info(f"Wheel speed matched within tolerance")
-                        if request.deceleration is not None:
-                            logger.info(f"Deceleration matched: {request.deceleration}ms")
-                        return int(row['pockets_to_win'])
+                        except (ValueError, TypeError):
+                            continue
+                    
+                    # This is a match - add winning number
+                    if row.get('winning_number'):
+                        winning_numbers.append(int(row['winning_number']))
                 
-                logger.info(f"No exact match found for: speed={request.ball_speed_ms}, "
-                          f"traveled={request.traveled_pockets}, direction={request.direction}, "
-                          f"wheel_speed={wheel_speed}, deceleration={request.deceleration}")
-                return None
+                if winning_numbers:
+                    logger.info(f"Found {len(winning_numbers)} exact matches for "
+                              f"speed={ball_speed}ms, pockets={traveled_pockets}, "
+                              f"angle={green_angle_ts2:.1f}°" if green_angle_ts2 else "")
+                
+                return winning_numbers
                 
         except Exception as e:
             logger.error(f"Error searching database: {e}")
-            return None
+            return []
     
     def store_pending(self, request: PredictionRequest):
         """Store round data temporarily until winning number arrives"""
         
-        # CHANGE 5: Calculate wheel speed in degrees per second
+        # Calculate wheel speed if both angles are provided
         wheel_speed = None
         if request.green_angle_ts1 is not None and request.green_angle_ts2 is not None:
             angle_diff = request.green_angle_ts2 - request.green_angle_ts1
             if angle_diff < 0:
                 angle_diff += 360
-            wheel_speed = angle_diff / (request.ball_speed_ms / 1000.0)  # degrees per second
-            logger.info(f"Calculated wheel speed: {wheel_speed:.1f} degrees/second")
+            wheel_speed = angle_diff  # degrees traveled during ball_speed_ms time
+            logger.info(f"Calculated wheel speed: {wheel_speed:.1f} degrees in {request.ball_speed_ms}ms")
         
         self.pending_rounds[request.round_id] = {
             'timestamp': datetime.now().isoformat(),
+            'table_id': request.table_id,
             'ball_speed_ms': request.ball_speed_ms,
-            'period1_ms': request.period1_ms,
-            'period2_ms': request.period2_ms,
-            'deceleration': request.deceleration,
             'traveled_pockets': request.traveled_pockets,
             'number_at_ts2': request.number_at_ts2,
-            'number_at_ts3': request.number_at_ts3,
             'direction': request.direction,
             'green_angle_ts1': request.green_angle_ts1,
             'green_angle_ts2': request.green_angle_ts2,
-            'green_angle_ts3': request.green_angle_ts3,
-            'wheel_speed': wheel_speed,
-            'rotor_direction': request.rotor_direction  # CHANGE 6: Store rotor direction
+            'wheel_speed': wheel_speed
         }
-        logger.info(f"Stored pending round: {request.round_id}, wheel_speed: {wheel_speed}")
-        if request.deceleration:
-            logger.info(f"With deceleration: {request.deceleration}ms")
+        logger.info(f"Stored pending round: {request.round_id}")
     
     def complete_round(self, round_id: str, winning_number: int) -> Dict[str, Any]:
         """Complete round with winning number and save to database"""
@@ -244,11 +216,9 @@ class PatternDatabase:
         
         pending = self.pending_rounds[round_id]
         
-        # Calculate pockets from reference number to winning number
-        # Use TS3 if available, otherwise TS2
-        reference_number = pending['number_at_ts3'] if pending['number_at_ts3'] is not None else pending['number_at_ts2']
+        # Calculate pockets from TS2 to winning number
         pockets_to_win = calculate_pocket_distance(
-            reference_number,
+            pending['number_at_ts2'],
             winning_number,
             pending['direction']
         )
@@ -257,21 +227,16 @@ class PatternDatabase:
         record = {
             'timestamp': pending['timestamp'],
             'round_id': round_id,
+            'table_id': pending['table_id'],
             'ball_speed_ms': pending['ball_speed_ms'],
-            'period1_ms': pending['period1_ms'],
-            'period2_ms': pending['period2_ms'],
-            'deceleration': pending['deceleration'],
             'traveled_pockets': pending['traveled_pockets'],
             'number_at_ts2': pending['number_at_ts2'],
-            'number_at_ts3': pending['number_at_ts3'],
             'direction': pending['direction'],
             'winning_number': winning_number,
             'pockets_to_win': pockets_to_win,
             'green_angle_ts1': pending['green_angle_ts1'],
             'green_angle_ts2': pending['green_angle_ts2'],
-            'green_angle_ts3': pending['green_angle_ts3'],
-            'wheel_speed': pending['wheel_speed'],
-            'rotor_direction': pending['rotor_direction']  # CHANGE 7: Save rotor direction
+            'wheel_speed': pending['wheel_speed']
         }
         
         # Save to CSV
@@ -284,9 +249,7 @@ class PatternDatabase:
             del self.pending_rounds[round_id]
             
             logger.info(f"Completed round {round_id}: winning={winning_number}, "
-                       f"offset={pockets_to_win}, total_records={self.total_records}")
-            if pending['number_at_ts3'] is not None:
-                logger.info(f"Using TS3 reference: {pending['number_at_ts3']}")
+                       f"total_records={self.total_records}")
             
             return {
                 "success": True,
@@ -301,45 +264,57 @@ class PatternDatabase:
                 "error": str(e)
             }
     
-    def get_prediction(self, request: PredictionRequest) -> Optional[int]:
-        """Get prediction based on exact pattern match"""
+    def get_prediction(self, request: PredictionRequest) -> Optional[Dict[str, Any]]:
+        """Get prediction using final memory approach"""
         
         # First, store the pending round
         self.store_pending(request)
         
-        # Calculate wheel speed for matching
-        wheel_speed = None
-        if request.green_angle_ts1 is not None and request.green_angle_ts2 is not None:
-            angle_diff = request.green_angle_ts2 - request.green_angle_ts1
-            if angle_diff < 0:
-                angle_diff += 360
-            wheel_speed = angle_diff / (request.ball_speed_ms / 1000.0)  # degrees per second
+        # Find all matching winning numbers
+        winning_numbers = self.find_final_matches(
+            request.ball_speed_ms,
+            request.traveled_pockets,
+            request.direction,
+            request.green_angle_ts2,
+            request.table_id
+        )
         
-        # Look for exact match in database
-        offset = self.find_exact_match(request, wheel_speed)
+        if not winning_numbers:
+            return None
         
-        if offset is not None:
-            # Calculate predicted number from reference
-            reference_number = request.number_at_ts3 if request.number_at_ts3 is not None else request.number_at_ts2
-            predicted = get_number_at_distance(
-                reference_number,
-                offset,
-                request.direction
-            )
-            
-            logger.info(f"Prediction for round {request.round_id}: "
-                       f"number={predicted} (offset={offset} from {reference_number})")
-            return predicted
+        # Count occurrences of each number
+        number_counts = Counter(winning_numbers)
         
-        return None
+        # Get most common number and its count
+        most_common_number, count = number_counts.most_common(1)[0]
+        
+        # Calculate confidence as percentage of total matches
+        confidence = count / len(winning_numbers)
+        
+        # Get top 3 predictions with their percentages
+        top3 = []
+        for number, cnt in number_counts.most_common(3):
+            percentage = cnt / len(winning_numbers)
+            top3.append([number, round(percentage, 2)])
+        
+        logger.info(f"Prediction for round {request.round_id}: "
+                   f"number={most_common_number} (confidence={confidence:.2f}, "
+                   f"based on {len(winning_numbers)} matches)")
+        
+        return {
+            "predicted_number": most_common_number,
+            "confidence": round(confidence, 2),
+            "matches_found": len(winning_numbers),
+            "top3": top3
+        }
 
 # ============================================================================
 # API SERVER
 # ============================================================================
 
 app = FastAPI(
-    title="Simple Roulette Pattern Server v2",
-    description="Exact pattern matching prediction system with TS3 support",
+    title="Roulette Final Memory Server",
+    description="Direct final number prediction based on exact historical matches",
     version="2.0.0"
 )
 
@@ -359,47 +334,49 @@ db = PatternDatabase()
 async def status():
     """Server status and statistics"""
     return {
-        "server": "Simple Roulette Pattern Server",
+        "server": "Roulette Final Memory Server",
         "version": "2.0.0",
         "status": "operational",
-        "method": "exact_pattern_matching_with_ts3",
-        "features": ["3-point measurement", "deceleration tracking", "wheel speed matching", "rotor direction"],
+        "method": "final_memory_exact_match",
         "statistics": {
             "total_records": db.total_records,
             "pending_rounds": len(db.pending_rounds)
+        },
+        "tolerances": {
+            "speed_ms": MS_TOLERANCE,
+            "pockets": POCKETS_TOLERANCE,
+            "angle_degrees": ANGLE_TOLERANCE
         }
     }
 
 @app.post("/predict")
 async def predict(request: PredictionRequest):
-    """Get prediction based on exact pattern match"""
+    """Get prediction based on final memory with exact matching"""
     
     try:
-        # Get prediction
-        predicted_number = db.get_prediction(request)
+        # Get prediction using final memory approach
+        result = db.get_prediction(request)
         
-        if predicted_number is not None:
-            # Found exact match - return prediction
+        if result:
+            # Found matches - return prediction
             return {
-                "predicted_number": predicted_number,
-                "confidence": 1.0,  # Exact match = 100% confidence in pattern
+                "predicted_number": result["predicted_number"],
+                "confidence": result["confidence"],
+                "matches_found": result["matches_found"],
                 "dataset_rows": db.total_records,
-                "method": "exact_match_ts3" if request.number_at_ts3 else "exact_match_ts2",
-                "matches_found": 1,
-                "accuracy_metrics": {
-                    "confidence_level": "high" if request.deceleration else "medium"
-                }
+                "top3": result["top3"],
+                "method": "final_memory"
             }
         else:
-            # No exact match found
+            # No exact matches found
             return {
                 "predicted_number": None,
                 "confidence": 0.0,
-                "dataset_rows": db.total_records,
                 "matches_found": 0,
-                "message": f"No exact match for speed={request.ball_speed_ms}ms, "
-                          f"traveled={request.traveled_pockets}, "
-                          f"deceleration={request.deceleration}ms"
+                "dataset_rows": db.total_records,
+                "message": f"No exact matches for speed={request.ball_speed_ms}ms, "
+                          f"pockets={request.traveled_pockets}, "
+                          f"angle={request.green_angle_ts2:.1f}°" if request.green_angle_ts2 else ""
             }
     
     except Exception as e:
@@ -432,37 +409,56 @@ async def log_winner(request: WinnerRequest):
 
 @app.get("/statistics")
 async def statistics():
-    """Get detailed statistics"""
+    """Get detailed statistics about collected data"""
     
-    # Count patterns by speed/pockets combination
-    pattern_counts = {}
-    ts3_count = 0
+    # Count patterns by parameter combinations
+    pattern_stats = defaultdict(lambda: {"count": 0, "winning_distribution": defaultdict(int)})
     
     try:
         with open(DATABASE_FILE, 'r', encoding='utf-8') as f:
             reader = csv.DictReader(f)
             
             for row in reader:
+                # Create pattern key
                 key = f"{row['ball_speed_ms']}ms_{row['traveled_pockets']}p_{row['direction']}"
-                pattern_counts[key] = pattern_counts.get(key, 0) + 1
+                pattern_stats[key]["count"] += 1
                 
-                # Count TS3 records
-                if row.get('number_at_ts3'):
-                    ts3_count += 1
+                # Track winning number distribution
+                if row.get('winning_number'):
+                    pattern_stats[key]["winning_distribution"][row['winning_number']] += 1
     except:
         pass
     
+    # Convert to list and calculate entropy for each pattern
+    pattern_list = []
+    for pattern, data in pattern_stats.items():
+        total = data["count"]
+        distribution = data["winning_distribution"]
+        
+        # Find most common winning number
+        if distribution:
+            most_common = max(distribution.items(), key=lambda x: x[1])
+            confidence = most_common[1] / total
+        else:
+            most_common = (None, 0)
+            confidence = 0
+        
+        pattern_list.append({
+            "pattern": pattern,
+            "occurrences": total,
+            "most_common_winner": most_common[0],
+            "confidence": round(confidence, 2),
+            "unique_outcomes": len(distribution)
+        })
+    
+    # Sort by occurrences
+    pattern_list.sort(key=lambda x: x["occurrences"], reverse=True)
+    
     return {
         "total_records": db.total_records,
-        "ts3_records": ts3_count,
-        "ts2_only_records": db.total_records - ts3_count,
         "pending_rounds": len(db.pending_rounds),
-        "unique_patterns": len(pattern_counts),
-        "pattern_distribution": dict(sorted(
-            pattern_counts.items(), 
-            key=lambda x: x[1], 
-            reverse=True
-        )[:20])  # Top 20 patterns
+        "unique_patterns": len(pattern_stats),
+        "top_patterns": pattern_list[:20]  # Top 20 patterns
     }
 
 @app.delete("/clear_pending")
@@ -480,24 +476,22 @@ if __name__ == "__main__":
     import uvicorn
     
     print("\n" + "="*60)
-    print("SIMPLE ROULETTE PATTERN SERVER v2.0.0")
-    print("Exact Pattern Matching Method with TS3 Support")
+    print("ROULETTE FINAL MEMORY SERVER v2.0.0")
+    print("Direct Final Number Prediction Method")
     print("="*60)
     print(f"Database: {DATABASE_FILE}")
     print(f"Records: {db.total_records}")
     print("="*60)
-    print("\nServer starting on http://0.0.0.0:8000")
-    print("\nWhat's new in v2.0.0:")
-    print("- Collects 3 timestamps for better accuracy")
-    print("- Tracks ball deceleration between periods")
-    print("- Improved wheel speed matching (3% tolerance)")
-    print("- Rotor direction tracking")
-    print("- Reference from TS3 when available (more accurate)")
+    print("\nTolerance settings:")
+    print(f"- Speed: EXACT match (±{MS_TOLERANCE}ms)")
+    print(f"- Pockets: EXACT match (±{POCKETS_TOLERANCE})")
+    print(f"- Angle: ±{ANGLE_TOLERANCE}° maximum")
+    print("="*60)
     print("\nHow it works:")
-    print("1. Collects ball_speed_ms, traveled_pockets, and deceleration")
-    print("2. Searches for EXACT match in database")
-    print("3. If found, predicts same offset to winning number")
-    print("4. No match = no prediction (need more data)")
+    print("1. Stores winning_number for each round")
+    print("2. Searches for EXACT matches (speed, pockets, angle)")
+    print("3. Returns most common winning_number from matches")
+    print("4. More data = better statistical predictions")
     print("="*60 + "\n")
     
     uvicorn.run(app, host="0.0.0.0", port=8000, log_level="info")
