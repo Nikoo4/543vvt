@@ -8,7 +8,7 @@ import os
 import csv
 import json
 import logging
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Dict, Any, Optional, List
 from collections import Counter, defaultdict
 
@@ -44,10 +44,14 @@ CSV_COLUMNS = [
     'green_angle_ts1', 'green_angle_ts2', 'wheel_speed'
 ]
 
-# Tolerance settings (EXACT matching)
-MS_TOLERANCE = 0  # Exact speed match
+# Tolerance settings (Updated for matching)
+MS_TOLERANCE = 10  # ±10 milliseconds tolerance
 POCKETS_TOLERANCE = 0  # Exact pockets match
-ANGLE_TOLERANCE = 1.0  # Maximum 1 degree tolerance
+ANGLE_TOLERANCE = 0.3  # ±0.3 degrees tolerance
+
+# Maximum valid speed filter
+MAX_VALID_SPEED_MS = 1500  # Maximum valid ball speed
+TIME_WINDOW_SECONDS = 30  # Time window for grouping same spin
 
 # ============================================================================
 # DATA MODELS
@@ -133,7 +137,7 @@ class PatternDatabase:
                           table_id: str) -> List[int]:
         """
         Find ALL matches and return list of winning numbers
-        Uses EXACT matching with optional 1 degree tolerance for angle
+        Uses tolerance matching for speed and angle
         """
         if not os.path.exists(DATABASE_FILE):
             return []
@@ -149,13 +153,13 @@ class PatternDatabase:
                     if row.get('table_id') != table_id:
                         continue
                     
-                    # Check EXACT match on speed and pockets
-                    if (int(row['ball_speed_ms']) != ball_speed or
-                        int(row['traveled_pockets']) != traveled_pockets or
+                    # Check match with tolerances
+                    if (abs(int(row['ball_speed_ms']) - ball_speed) > MS_TOLERANCE or
+                        abs(int(row['traveled_pockets']) - traveled_pockets) > POCKETS_TOLERANCE or
                         row['direction'] != direction):
                         continue
                     
-                    # Check angle match if provided (1 degree tolerance)
+                    # Check angle match if provided
                     if green_angle_ts2 is not None and row.get('green_angle_ts2'):
                         try:
                             row_angle = float(row['green_angle_ts2'])
@@ -170,7 +174,7 @@ class PatternDatabase:
                         winning_numbers.append(int(row['winning_number']))
                 
                 if winning_numbers:
-                    logger.info(f"Found {len(winning_numbers)} exact matches for "
+                    logger.info(f"Found {len(winning_numbers)} matches for "
                               f"speed={ball_speed}ms, pockets={traveled_pockets}, "
                               f"angle={green_angle_ts2:.1f}°" if green_angle_ts2 else "")
                 
@@ -183,6 +187,11 @@ class PatternDatabase:
     def store_pending(self, request: PredictionRequest):
         """Store round data temporarily until winning number arrives"""
         
+        # Filter out invalid speeds
+        if request.ball_speed_ms > MAX_VALID_SPEED_MS:
+            logger.warning(f"Rejected round {request.round_id}: speed {request.ball_speed_ms}ms > {MAX_VALID_SPEED_MS}ms")
+            return
+        
         # Calculate wheel speed if both angles are provided
         wheel_speed = None
         if request.green_angle_ts1 is not None and request.green_angle_ts2 is not None:
@@ -192,8 +201,10 @@ class PatternDatabase:
             wheel_speed = angle_diff  # degrees traveled during ball_speed_ms time
             logger.info(f"Calculated wheel speed: {wheel_speed:.1f} degrees in {request.ball_speed_ms}ms")
         
+        # Store with precise timestamp for sorting
         self.pending_rounds[request.round_id] = {
             'timestamp': datetime.now().isoformat(),
+            'received_at': datetime.now(),  # For precise sorting
             'table_id': request.table_id,
             'ball_speed_ms': request.ball_speed_ms,
             'traveled_pockets': request.traveled_pockets,
@@ -208,35 +219,72 @@ class PatternDatabase:
     def complete_round(self, round_id: str, winning_number: int) -> Dict[str, Any]:
         """Complete round with winning number and save to database"""
         
+        # Find the reference round
         if round_id not in self.pending_rounds:
-            return {
-                "success": False,
-                "error": "Round not found in pending storage"
-            }
-        
-        pending = self.pending_rounds[round_id]
+            # Try to find any round from the same spin
+            current_time = datetime.now()
+            time_window_start = current_time - timedelta(seconds=TIME_WINDOW_SECONDS)
+            
+            # Find all rounds in time window
+            matching_rounds = []
+            for rid, data in self.pending_rounds.items():
+                if data['received_at'] >= time_window_start:
+                    matching_rounds.append((rid, data))
+            
+            if not matching_rounds:
+                return {
+                    "success": False,
+                    "error": "No pending rounds found in time window"
+                }
+            
+            # Group by table_id
+            table_rounds = defaultdict(list)
+            for rid, data in matching_rounds:
+                table_rounds[data['table_id']].append((rid, data))
+            
+            # Find the most likely table (with most entries)
+            max_table = max(table_rounds.items(), key=lambda x: len(x[1]))
+            table_id, rounds = max_table
+            
+            # Sort by received time and take the first
+            rounds.sort(key=lambda x: x[1]['received_at'])
+            selected_round_id, selected_data = rounds[0]
+            
+            logger.info(f"Selected first round {selected_round_id} from {len(rounds)} rounds on table {table_id}")
+        else:
+            # Direct match found
+            selected_round_id = round_id
+            selected_data = self.pending_rounds[round_id]
+            table_id = selected_data['table_id']
+            
+            # Still need to find related rounds to delete them
+            current_time = datetime.now()
+            time_window_start = current_time - timedelta(seconds=TIME_WINDOW_SECONDS)
+            
+            rounds = [(rid, data) for rid, data in self.pending_rounds.items()
+                     if data['table_id'] == table_id and data['received_at'] >= time_window_start]
         
         # Calculate pockets from TS2 to winning number
         pockets_to_win = calculate_pocket_distance(
-            pending['number_at_ts2'],
+            selected_data['number_at_ts2'],
             winning_number,
-            pending['direction']
+            selected_data['direction']
         )
         
         # Prepare complete record
         record = {
-            'timestamp': pending['timestamp'],
-            'round_id': round_id,
-            'table_id': pending['table_id'],
-            'ball_speed_ms': pending['ball_speed_ms'],
-            'traveled_pockets': pending['traveled_pockets'],
-            'number_at_ts2': pending['number_at_ts2'],
-            'direction': pending['direction'],
+            'timestamp': selected_data['timestamp'],
+            'round_id': selected_round_id,
+            'table_id': selected_data['table_id'],
+            'ball_speed_ms': selected_data['ball_speed_ms'],
+            'traveled_pockets': selected_data['traveled_pockets'],
+            'number_at_ts2': selected_data['number_at_ts2'],
+            'direction': selected_data['direction'],
             'winning_number': winning_number,
             'pockets_to_win': pockets_to_win,
-            'green_angle_ts1': pending['green_angle_ts1'],
-            'green_angle_ts2': pending['green_angle_ts2'],
-            'wheel_speed': pending['wheel_speed']
+            'green_angle_ts1': selected_data['green_angle_ts1'],
+            'green_angle_ts2': selected_data['green_angle_ts2'],
+            'wheel_speed': selected_data['wheel_speed']
         }
         
         # Save to CSV
@@ -246,15 +294,23 @@ class PatternDatabase:
                 writer.writerow(record)
             
             self.total_records += 1
-            del self.pending_rounds[round_id]
             
-            logger.info(f"Completed round {round_id}: winning={winning_number}, "
-                       f"total_records={self.total_records}")
+            # Delete ALL rounds from the same spin
+            deleted_count = 0
+            for rid, data in list(self.pending_rounds.items()):
+                if (data['table_id'] == table_id and 
+                    data['received_at'] >= time_window_start):
+                    del self.pending_rounds[rid]
+                    deleted_count += 1
+            
+            logger.info(f"Completed round {selected_round_id}: winning={winning_number}, "
+                       f"deleted {deleted_count} pending rounds, total_records={self.total_records}")
             
             return {
                 "success": True,
                 "pockets_to_win": pockets_to_win,
-                "total_records": self.total_records
+                "total_records": self.total_records,
+                "deleted_pending": deleted_count
             }
             
         except Exception as e:
@@ -269,6 +325,10 @@ class PatternDatabase:
         
         # First, store the pending round
         self.store_pending(request)
+        
+        # Skip prediction if speed is invalid
+        if request.ball_speed_ms > MAX_VALID_SPEED_MS:
+            return None
         
         # Find all matching winning numbers
         winning_numbers = self.find_final_matches(
@@ -314,7 +374,7 @@ class PatternDatabase:
 
 app = FastAPI(
     title="Roulette Final Memory Server",
-    description="Direct final number prediction based on exact historical matches",
+    description="Direct final number prediction based on historical matches with filtering",
     version="2.0.0"
 )
 
@@ -337,7 +397,7 @@ async def status():
         "server": "Roulette Final Memory Server",
         "version": "2.0.0",
         "status": "operational",
-        "method": "final_memory_exact_match",
+        "method": "final_memory_with_filtering",
         "statistics": {
             "total_records": db.total_records,
             "pending_rounds": len(db.pending_rounds)
@@ -345,13 +405,14 @@ async def status():
         "tolerances": {
             "speed_ms": MS_TOLERANCE,
             "pockets": POCKETS_TOLERANCE,
-            "angle_degrees": ANGLE_TOLERANCE
+            "angle_degrees": ANGLE_TOLERANCE,
+            "max_valid_speed_ms": MAX_VALID_SPEED_MS
         }
     }
 
 @app.post("/predict")
 async def predict(request: PredictionRequest):
-    """Get prediction based on final memory with exact matching"""
+    """Get prediction based on final memory with tolerance matching"""
     
     try:
         # Get prediction using final memory approach
@@ -368,15 +429,17 @@ async def predict(request: PredictionRequest):
                 "method": "final_memory"
             }
         else:
-            # No exact matches found
+            # No matches found or invalid data
+            message = f"No matches for speed={request.ball_speed_ms}ms"
+            if request.ball_speed_ms > MAX_VALID_SPEED_MS:
+                message = f"Invalid speed: {request.ball_speed_ms}ms > {MAX_VALID_SPEED_MS}ms"
+            
             return {
                 "predicted_number": None,
                 "confidence": 0.0,
                 "matches_found": 0,
                 "dataset_rows": db.total_records,
-                "message": f"No exact matches for speed={request.ball_speed_ms}ms, "
-                          f"pockets={request.traveled_pockets}, "
-                          f"angle={request.green_angle_ts2:.1f}°" if request.green_angle_ts2 else ""
+                "message": message
             }
     
     except Exception as e:
@@ -394,7 +457,8 @@ async def log_winner(request: WinnerRequest):
             return {
                 "stored": True,
                 "dataset_rows": result["total_records"],
-                "pockets_recorded": result["pockets_to_win"]
+                "pockets_recorded": result["pockets_to_win"],
+                "deleted_pending": result.get("deleted_pending", 1)
             }
         else:
             return {
@@ -458,7 +522,9 @@ async def statistics():
         "total_records": db.total_records,
         "pending_rounds": len(db.pending_rounds),
         "unique_patterns": len(pattern_stats),
-        "top_patterns": pattern_list[:20]  # Top 20 patterns
+        "top_patterns": pattern_list[:20],  # Top 20 patterns
+        "time_window_seconds": TIME_WINDOW_SECONDS,
+        "max_valid_speed_ms": MAX_VALID_SPEED_MS
     }
 
 @app.delete("/clear_pending")
@@ -477,21 +543,24 @@ if __name__ == "__main__":
     
     print("\n" + "="*60)
     print("ROULETTE FINAL MEMORY SERVER v2.0.0")
-    print("Direct Final Number Prediction Method")
+    print("Direct Final Number Prediction Method with Filtering")
     print("="*60)
     print(f"Database: {DATABASE_FILE}")
     print(f"Records: {db.total_records}")
     print("="*60)
     print("\nTolerance settings:")
-    print(f"- Speed: EXACT match (±{MS_TOLERANCE}ms)")
-    print(f"- Pockets: EXACT match (±{POCKETS_TOLERANCE})")
-    print(f"- Angle: ±{ANGLE_TOLERANCE}° maximum")
+    print(f"- Speed: ±{MS_TOLERANCE}ms tolerance")
+    print(f"- Pockets: ±{POCKETS_TOLERANCE} (exact match)")
+    print(f"- Angle: ±{ANGLE_TOLERANCE}° tolerance")
+    print(f"- Max valid speed: {MAX_VALID_SPEED_MS}ms")
+    print(f"- Time window: {TIME_WINDOW_SECONDS} seconds")
     print("="*60)
     print("\nHow it works:")
-    print("1. Stores winning_number for each round")
-    print("2. Searches for EXACT matches (speed, pockets, angle)")
-    print("3. Returns most common winning_number from matches")
-    print("4. More data = better statistical predictions")
+    print("1. Filters data by speed (<1500ms)")
+    print("2. Groups rounds by table_id and time window")
+    print("3. Stores only first round from each group")
+    print("4. Uses tolerances for prediction matching")
+    print("5. Deletes all pending rounds after recording winner")
     print("="*60 + "\n")
     
     uvicorn.run(app, host="0.0.0.0", port=8000, log_level="info")
